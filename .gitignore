@@ -13,6 +13,9 @@ venv/
 # Dados pesados e cache
 data/cache/
 data/raw/
+data/cvm/raw/*.zip
+data/cvm/raw/cad_cia_aberta.csv
+data/cvm/processed/
 *.csv
 !data/bloomberg/*.csv
 *.parquet

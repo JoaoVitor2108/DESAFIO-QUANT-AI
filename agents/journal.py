@@ -33,6 +33,7 @@ from config import (
     UNIVERSO_HISTORICO,
     tickers_ativos,
 )
+from agents.sources.cvm import CVMSource
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,9 @@ class Fundamentals:
     ticker: str
     data_referencia: pd.Timestamp
     trimestre_fim: Optional[pd.Timestamp] = None
+    data_recebimento_cvm: Optional[pd.Timestamp] = None  # DT_RECEB da CVM (anti-lookahead preciso)
+    tipo_doc: Optional[str] = None             # "ITR" ou "DFP"
+    periodicidade: Optional[dict] = None       # {"receita": "TTM", "caixa": "point_in_time", ...}
     pl: Optional[float] = None
     pvp: Optional[float] = None
     roe: Optional[float] = None
@@ -516,10 +520,12 @@ class JournalAgent:
         ticker: str,
         data_limite: pd.Timestamp,
     ) -> Fundamentals:
-        """Retorna métricas fundamentalistas brutas com lag de 45 dias (CVM Res. 80).
+        """Retorna métricas fundamentalistas brutas.
 
-        P/L e P/VP são calculados best-effort via get_shares_full + preço histórico.
-        Falhas nesse cálculo geram aviso explícito — nunca número silenciosamente errado.
+        Fonte primária: CVM (dados abertos, DT_RECEB como marco de disponibilidade).
+        Fallback yfinance: apenas para campo 'setor' (sector classification).
+        P/L e P/VP: best-effort com ações em circulação da CVM + preço do yfinance.
+        Qualquer falha gera aviso explícito — nunca número silenciosamente errado.
         """
         _validate_aware(data_limite, "data_limite")
         cache_key = {"t": ticker, "dl": str(data_limite.date())}
@@ -528,164 +534,95 @@ class JournalAgent:
             return cached
 
         result = Fundamentals(ticker=ticker, data_referencia=data_limite)
-        t = yf.Ticker(ticker)
 
-        # Setor — único uso legítimo de .info (dado estático, não snapshot de preço)
-        try:
-            result.setor = t.info.get("sector")
-        except Exception as e:
-            result.avisos.append(f"Falha ao obter setor via info: {e}")
+        # Setor do universo histórico (fonte mais confiável)
+        info_universo = UNIVERSO_HISTORICO.get(ticker, {})
+        result.setor = info_universo.get("setor")
 
-        # Demonstrações trimestrais
-        fin = pd.DataFrame()
-        bs = pd.DataFrame()
-        try:
-            _fin = getattr(t, "quarterly_income_stmt", None)
-            fin = _fin if (_fin is not None and not _fin.empty) else t.quarterly_financials
-        except Exception as e:
-            result.avisos.append(f"quarterly_income_stmt indisponível: {e}")
-        try:
-            bs = t.quarterly_balance_sheet
-        except Exception as e:
-            result.avisos.append(f"quarterly_balance_sheet indisponível: {e}")
+        # Se não estiver no universo, tentar yfinance (fallback, apenas setor)
+        if result.setor is None:
+            try:
+                result.setor = yf.Ticker(ticker).info.get("sector")
+            except Exception as e:
+                result.avisos.append(f"setor via yfinance falhou: {e}")
 
-        if fin.empty and bs.empty:
-            result.avisos.append("Sem dados trimestrais; todos os campos financeiros são None")
-            self._cache.set("get_fundamentals", cache_key, result)
-            return result
+        # ── CVM como fonte primária de fundamentals ───────────────────────────
+        cd_cvm = info_universo.get("cd_cvm")
+        cnpj = info_universo.get("cnpj")
 
-        lag = pd.Timedelta(days=LAG_FUNDAMENTALS_DIAS)
-
-        def _eligible(df: pd.DataFrame) -> list[tuple[pd.Timestamp, object]]:
-            cols = []
-            for col in df.columns:
-                try:
-                    ts = pd.Timestamp(col)
-                    if ts.tzinfo is None:
-                        ts = ts.tz_localize(FUSO)
-                    else:
-                        ts = ts.tz_convert(FUSO)
-                    if ts + lag <= data_limite:
-                        cols.append((ts, col))
-                except Exception:
-                    continue
-            return sorted(cols, reverse=True)
-
-        fin_cols = _eligible(fin)
-        bs_cols = _eligible(bs)
-
-        if not fin_cols and not bs_cols:
+        if cd_cvm is None:
             result.avisos.append(
-                f"Nenhum trimestre elegível com lag={lag.days}d até {data_limite.date()}"
+                f"cd_cvm não encontrado em UNIVERSO_HISTORICO para {ticker}; "
+                "adicione o campo em config.py para habilitar dados da CVM"
             )
             self._cache.set("get_fundamentals", cache_key, result)
             return result
 
-        result.trimestre_fim = fin_cols[0][0] if fin_cols else bs_cols[0][0]
+        cvm = CVMSource()
+        cvm_data = None
+        try:
+            cvm_data = cvm.get_fundamentals(cd_cvm, data_limite)
+        except Exception as e:
+            result.avisos.append(f"CVMSource.get_fundamentals falhou: {e}")
 
-        def _row(df: pd.DataFrame, col, *names) -> Optional[float]:
-            for name in names:
-                try:
-                    val = df.loc[name, col]
-                    if pd.notna(val):
-                        return float(val)
-                except (KeyError, TypeError):
-                    continue
-            return None
+        if cvm_data is None:
+            result.avisos.append(
+                f"CVM sem dados disponíveis para cd_cvm={cd_cvm} até {data_limite.date()}"
+            )
+            self._cache.set("get_fundamentals", cache_key, result)
+            return result
 
-        # TTM para itens de fluxo (soma dos últimos 4 trimestres elegíveis)
-        lucros, receitas, ebitdas = [], [], []
-        for _, col in fin_cols[:4]:
-            v = _row(fin, col, "Net Income", "Net Income Common Stockholders",
-                     "Net Income From Continuing Operations")
-            if v is not None:
-                lucros.append(v)
-            v = _row(fin, col, "Total Revenue", "Revenue")
-            if v is not None:
-                receitas.append(v)
-            v = _row(fin, col, "EBITDA", "Ebitda", "Normalized EBITDA")
-            if v is not None:
-                ebitdas.append(v)
+        # Mapear campos CVM → Fundamentals
+        result.trimestre_fim = cvm_data.get("dt_refer")
+        result.data_recebimento_cvm = cvm_data.get("dt_receb")
+        result.tipo_doc = cvm_data.get("tipo_doc")
+        result.periodicidade = cvm_data.get("periodicidade")
+        result.lucro_liquido = cvm_data.get("lucro_liquido")
+        result.receita = cvm_data.get("receita")
+        result.ebitda = cvm_data.get("ebitda_aproximado")
+        result.patrimonio = cvm_data.get("patrimonio_liquido")
+        result.divida = cvm_data.get("divida_bruta")
+        result.caixa = cvm_data.get("caixa")
 
-        result.lucro_liquido = sum(lucros) if lucros else None
-        result.receita = sum(receitas) if receitas else None
-        result.ebitda = sum(ebitdas) if ebitdas else None
+        for aviso in cvm_data.get("avisos", []):
+            result.avisos.append(f"[CVM] {aviso}")
 
-        if result.lucro_liquido is None:
-            result.avisos.append("lucro_liquido não encontrado nas demonstrações")
-        if result.receita is None:
-            result.avisos.append("receita não encontrada nas demonstrações")
-
+        # Métricas derivadas
         if result.lucro_liquido is not None and result.receita:
             result.margem_liquida = result.lucro_liquido / result.receita
-
-        # Balance sheet — estoque: usar trimestre mais recente elegível
-        if bs_cols:
-            _, bs_col = bs_cols[0]
-            result.patrimonio = _row(
-                bs, bs_col, "Stockholders Equity", "Common Stock Equity",
-                "Total Stockholder Equity",
-            )
-            result.caixa = _row(
-                bs, bs_col, "Cash And Cash Equivalents", "Cash",
-                "Cash Cash Equivalents And Short Term Investments",
-                "Cash And Short Term Investments",
-            )
-            d_lp = _row(bs, bs_col, "Long Term Debt",
-                        "Long Term Debt And Capital Lease Obligation")
-            d_cp = _row(bs, bs_col, "Current Debt",
-                        "Current Debt And Capital Lease Obligation")
-            if d_lp is not None or d_cp is not None:
-                result.divida = (d_lp or 0.0) + (d_cp or 0.0)
-
-        if result.patrimonio is None:
-            result.avisos.append("patrimonio não encontrado; P/VP e ROE indisponíveis")
-        if result.caixa is None:
-            result.avisos.append("caixa não encontrado; dívida líquida pode ser imprecisa")
 
         if result.lucro_liquido is not None and result.patrimonio:
             result.roe = result.lucro_liquido / result.patrimonio
 
-        if result.divida is not None and result.caixa is not None and result.ebitda:
-            result.divida_liquida_ebitda = (result.divida - result.caixa) / result.ebitda
+        div_liq = cvm_data.get("divida_liquida")
+        if div_liq is not None and result.ebitda:
+            result.divida_liquida_ebitda = div_liq / result.ebitda
 
-        # P/L e P/VP — best-effort: qualquer falha → aviso explícito, nunca NaN silencioso
+        # ── P/L e P/VP — best-effort: ações CVM + preço yfinance ─────────────
         try:
-            shares_data = t.get_shares_full(
-                start=(data_limite - pd.Timedelta(days=10)).date(),
-                end=data_limite.date(),
-            )
-            if shares_data is None or len(shares_data) == 0:
-                result.avisos.append(
-                    "get_shares_full retornou vazio; P/L e P/VP indisponíveis"
-                )
+            shares = cvm.get_acoes_em_circulacao(cd_cvm, data_limite, cnpj=cnpj)
+            if shares is None or shares == 0:
+                result.avisos.append("ações em circulação indisponíveis; P/L e P/VP não calculados")
             else:
-                shares = float(shares_data.iloc[-1])
-                preco_df = self.get_precos(
-                    ticker,
-                    data_limite - pd.Timedelta(days=10),
-                    data_limite,
-                )
+                preco_df = self.get_precos(ticker, data_limite - pd.Timedelta(days=10), data_limite)
                 close_vals = preco_df["Close"].dropna()
                 if close_vals.empty:
-                    result.avisos.append("Preço histórico vazio; P/L e P/VP indisponíveis")
+                    result.avisos.append("preço histórico vazio; P/L e P/VP não calculados")
                 else:
                     preco = float(close_vals.iloc[-1])
                     mkt_cap = shares * preco
+
                     if result.lucro_liquido and result.lucro_liquido > 0:
                         result.pl = mkt_cap / result.lucro_liquido
                     else:
-                        result.avisos.append(
-                            "Lucro líquido ausente, negativo ou zero; P/L não calculado"
-                        )
+                        result.avisos.append("lucro ≤ 0; P/L não calculado")
+
                     if result.patrimonio and result.patrimonio > 0:
                         result.pvp = mkt_cap / result.patrimonio
                     else:
-                        result.avisos.append(
-                            "Patrimônio ausente ou ≤ 0; P/VP não calculado"
-                        )
+                        result.avisos.append("patrimônio ≤ 0; P/VP não calculado")
         except Exception as e:
-            result.avisos.append(f"Falha best-effort P/L e P/VP: {e}")
+            result.avisos.append(f"falha best-effort P/L e P/VP: {e}")
 
         self._cache.set("get_fundamentals", cache_key, result)
         return result

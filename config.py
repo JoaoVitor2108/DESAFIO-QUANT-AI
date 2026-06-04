@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 FUSO = "America/Sao_Paulo"
-LAG_FUNDAMENTALS_DIAS = 45
+LAG_FUNDAMENTALS_DIAS = 45  # mantido para fallback yfinance; CVM usa DT_RECEB
 HORARIO_CORTE_B3 = "17:05"
 INICIO_WARMUP = pd.Timestamp("2019-01-01", tz=FUSO)
 FIM_BACKTEST = pd.Timestamp("2024-12-31 23:59:59", tz=FUSO)
@@ -16,6 +16,8 @@ def _ts(date_str: str) -> pd.Timestamp:
 # Universo histórico: composição do IBOV ao longo de 2019-2024.
 # entrada=None  → ticker já estava no índice em 01/01/2019.
 # saida=None    → ticker ainda estava no índice em 31/12/2024.
+# cd_cvm        → código CVM (fonte: cad_cia_aberta.csv). Usado pelo CVMSource.
+# cnpj          → CNPJ da empresa (redundante, facilita joins com CVM).
 # Todos os timestamps são timezone-aware em America/Sao_Paulo.
 UNIVERSO_HISTORICO: dict[str, dict] = {
     # ── petroleo_gas ─────────────────────────────────────────────────────────
@@ -25,6 +27,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 9512,
+        "cnpj": "33.000.167/0001-01",
     },
     "PRIO3.SA": {
         "setor": "petroleo_gas",
@@ -32,6 +36,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "PetroRio ingressou no IBOV em 08/09/2020 (Money Times)",
+        "cd_cvm": 22187,
+        "cnpj": "10.629.105/0001-68",
     },
     # ── mineracao ─────────────────────────────────────────────────────────────
     "VALE3.SA": {
@@ -40,6 +46,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 4170,
+        "cnpj": "33.592.510/0001-54",
     },
     "CMIN3.SA": {
         "setor": "mineracao",
@@ -47,6 +55,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "IPO CSN Mineração 18/02/2021",
+        "cd_cvm": 25585,
+        "cnpj": "08.902.291/0001-15",
     },
     # ── industria ─────────────────────────────────────────────────────────────
     "WEGE3.SA": {
@@ -55,6 +65,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "WEG no IBOV desde 2016",
+        "cd_cvm": 5410,
+        "cnpj": "84.429.695/0001-11",
     },
     "GGBR4.SA": {
         "setor": "industria",
@@ -62,6 +74,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019 (siderurgia/metalurgia)",
+        "cd_cvm": 3980,
+        "cnpj": "33.611.500/0001-19",
     },
     # ── bancos ────────────────────────────────────────────────────────────────
     "ITUB4.SA": {
@@ -70,6 +84,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 19348,
+        "cnpj": "60.872.504/0001-23",
     },
     "BBDC4.SA": {
         "setor": "bancos",
@@ -77,6 +93,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 906,
+        "cnpj": "60.746.948/0001-12",
     },
     "BBAS3.SA": {
         "setor": "bancos",
@@ -84,6 +102,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 1023,
+        "cnpj": "00.000.000/0001-91",
     },
     "BPAC11.SA": {
         "setor": "bancos",
@@ -91,6 +111,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "BTG Pactual entrou no IBOV em 02/10/2019",
+        "cd_cvm": 22616,
+        "cnpj": "30.306.294/0001-45",
     },
     # ── alimentos_bebidas ─────────────────────────────────────────────────────
     "ABEV3.SA": {
@@ -99,6 +121,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 23264,
+        "cnpj": "07.526.557/0001-00",
     },
     "JBSS3.SA": {
         "setor": "alimentos_bebidas",
@@ -106,14 +130,20 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 20575,
+        "cnpj": "02.916.265/0001-60",
     },
     # ── energia_eletrica ──────────────────────────────────────────────────────
+    # ELET3: Privatizada jun/2022; renomeada para AXIA ENERGIA S.A. na CVM, mas
+    # CD_CVM=2437 e CNPJ permanecem os mesmos. Histórico CVM contínuo.
     "ELET3.SA": {
         "setor": "energia_eletrica",
         "entrada": None,
         "saida": None,
         "confianca": "alta",
-        "fonte": "B3 composição jan/2019; privatizada jun/2022, ticker mantido",
+        "fonte": "B3 composição jan/2019; privatizada jun/2022 → AXIA ENERGIA",
+        "cd_cvm": 2437,
+        "cnpj": "00.001.180/0001-26",
     },
     "EGIE3.SA": {
         "setor": "energia_eletrica",
@@ -121,6 +151,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 17329,
+        "cnpj": "02.474.103/0001-19",
     },
     # ── papel_celulose ────────────────────────────────────────────────────────
     "SUZB3.SA": {
@@ -129,6 +161,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019; fusão Suzano+Fibria concluída jan/2019",
+        "cd_cvm": 13986,
+        "cnpj": "16.404.287/0001-55",
     },
     "KLBN11.SA": {
         "setor": "papel_celulose",
@@ -136,6 +170,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 12653,
+        "cnpj": "89.637.490/0001-45",
     },
     # ── telecom ───────────────────────────────────────────────────────────────
     "VIVT3.SA": {
@@ -144,6 +180,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 17671,
+        "cnpj": "02.558.157/0001-62",
     },
     # ── saude ─────────────────────────────────────────────────────────────────
     "RDOR3.SA": {
@@ -152,6 +190,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "Inclusão no IBOV 06/09/2021; IPO 10/12/2020",
+        "cd_cvm": 24821,
+        "cnpj": "06.047.087/0001-39",
     },
     # ── varejo ────────────────────────────────────────────────────────────────
     "LREN3.SA": {
@@ -160,6 +200,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 8133,
+        "cnpj": "92.754.738/0001-62",
     },
     "MGLU3.SA": {
         "setor": "varejo",
@@ -167,6 +209,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 22470,
+        "cnpj": "47.960.950/0001-21",
     },
     # Survivorship bias — padrão "colapso abrupto": Americanas entrou em RJ em
     # jan/2023. O modelo treina com AMER3 durante a janela ativa e não projeta
@@ -178,6 +222,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": _ts("2023-01-12"),
         "confianca": "alta",
         "fonte": "AMER3 início 19/07/2021; recuperação judicial 12/01/2023",
+        "cd_cvm": 20990,
+        "cnpj": "00.776.574/0001-56",
     },
     # ── construcao ────────────────────────────────────────────────────────────
     "CYRE3.SA": {
@@ -186,6 +232,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
+        "cd_cvm": 14460,
+        "cnpj": "73.178.600/0001-18",
     },
     # ── tecnologia ────────────────────────────────────────────────────────────
     "TOTS3.SA": {
@@ -194,6 +242,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": None,
         "confianca": "alta",
         "fonte": "Totvs entrou no IBOV em 06/01/2020",
+        "cd_cvm": 19992,
+        "cnpj": "53.113.791/0001-22",
     },
     # ── outros ────────────────────────────────────────────────────────────────
     # Survivorship bias — padrão "lenta agonia": IRB revelou fraude contábil em
@@ -206,6 +256,8 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "saida": _ts("2023-01-02"),
         "confianca": "media",
         "fonte": "Excluído IBOV jan/2023; escândalo contábil fev/2020",
+        "cd_cvm": 24180,
+        "cnpj": "33.376.989/0001-91",
     },
 }
 

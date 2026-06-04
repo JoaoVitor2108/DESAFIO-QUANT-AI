@@ -142,14 +142,13 @@ class TestGetFundamentals:
         for a in fund.avisos:
             assert isinstance(a, str)
 
-    def test_lag_45_dias_respeitado(self):
-        # Trimestre mais recente elegível deve satisfazer (fim + 45d) <= data_limite
+    def test_dt_receb_respeitado(self):
+        # Trimestre mais recente deve ter DT_RECEB (data receb. CVM) <= data_limite
         limite = pd.Timestamp.now(tz=_SP) - pd.Timedelta(days=60)
         fund = _AGENT.get_fundamentals("PETR4.SA", limite)
-        if fund.trimestre_fim is not None:
-            from config import LAG_FUNDAMENTALS_DIAS
-            assert fund.trimestre_fim + pd.Timedelta(days=LAG_FUNDAMENTALS_DIAS) <= limite, (
-                "Trimestre dentro do lag de 45 dias — lookahead nos fundamentals!"
+        if fund.data_recebimento_cvm is not None:
+            assert fund.data_recebimento_cvm <= limite, (
+                f"Lookahead: DT_RECEB={fund.data_recebimento_cvm} > data_limite={limite.date()}"
             )
 
     def test_data_limite_antiga_sem_dados_nao_levanta(self):
