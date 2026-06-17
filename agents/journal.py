@@ -216,16 +216,19 @@ class JournalAgent:
 
     # ── 0. Health check ───────────────────────────────────────────────────────
 
-    def health_check(self, timeout: int = 3) -> dict[str, str]:
+    def health_check(self, timeout: int = 8) -> dict[str, str]:
         """Status de cada fonte de dados, para diagnóstico antes de um backtest.
 
         Retorna dict {fonte: status} com status em:
-          "online"   — respondeu OK a uma requisição leve;
-          "offline"  — sem resposta, erro de rede ou status != 200;
+          "online"   — respondeu (200 ou 429 = vivo, mesmo rate-limitado);
+          "offline"  — sem resposta, erro de rede ou status inesperado;
           "sem_chave"— fonte exige API key e ela não está configurada;
           "vazio"    — fonte local sem dados (ex: Bloomberg sem CSV).
 
-        Requisições usam timeout curto (default 3s) e payload mínimo.
+        Timeout default de 8s (não 3s): o GDELT costuma responder em ~3–5s sob
+        carga e, quando rate-limitado, devolve 429 — um timeout curto estouraria
+        antes do 429 chegar e marcaria "offline" por engano. Com 8s o 429 chega
+        e é corretamente lido como "online" (vivo). Payload mínimo por fonte.
         """
         status = {
             "bloomberg_csv": self._health_bloomberg(),
