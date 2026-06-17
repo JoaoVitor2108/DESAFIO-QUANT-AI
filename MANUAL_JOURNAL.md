@@ -42,8 +42,16 @@ agents/
 ├── journal.py              # API pública - métodos consumidos pelos outros agentes
 └── sources/
     ├── __init__.py
-    └── cvm.py              # Leitor especializado dos dados abertos da CVM
+    ├── noticia.py          # Dataclass Noticia + helper de whitelist (tipo compartilhado)
+    ├── cvm.py              # Leitor especializado dos dados abertos da CVM
+    ├── gdelt.py            # Leitor do GDELT 2.0 Doc (notícias, volume histórico)
+    └── newsapi.py          # Leitor do NewsAPI (notícias, período recente com corpo)
 ```
+
+`noticia.py` existe para quebrar o import circular: tanto `journal.py` quanto
+as fontes de notícia precisam da dataclass `Noticia`. Colocá-la num módulo
+neutro permite que as fontes a importem sem importar o `journal.py` (que, por
+sua vez, importa as fontes).
 
 **Por que separar?** O parsing da CVM tem detalhes técnicos pesados (encoding
 latin-1, estrutura diferente para bancos, versões reapresentadas) e ocupa ~400
@@ -211,11 +219,63 @@ passa.
 O peso entra no ranking: ao deduplicar, mantemos a versão da fonte de maior
 peso.
 
+### Arquitetura modular das fontes
+
+Cada fonte é uma classe própria em `agents/sources/`, no mesmo padrão do
+`CVMSource`. O `JournalAgent` instancia `self.gdelt` e `self.newsapi` no
+construtor e apenas as orquestra. Vantagem: cada fonte é testável isolada
+(`tests/test_gdelt.py`, `tests/test_newsapi.py`), substituível, e uma falha
+nela não vaza para o resto.
+
+**GDELT (`gdelt.py`).** Endpoint `api.gdeltproject.org/api/v2/doc/doc`, sem
+chave de API. Cobertura desde 2015. Parâmetros: `mode=ArtList`, `format=json`,
+janela em `startdatetime`/`enddatetime` (UTC), `maxrecords` até 250. Limitação
+central: **não entrega o corpo do artigo** — só título, URL, domínio e
+`seendate`. Por isso é a camada de *volume histórico*, não de profundidade.
+O `seendate` (formato `YYYYMMDDTHHMMSSZ`, UTC) é convertido para SP.
+
+**NewsAPI (`newsapi.py`).** Endpoint `newsapi.org/v2/everything`, requer
+`NEWS_API_KEY`. Plano gratuito cobre **apenas os últimos 30 dias** — a fonte
+clampa `data_inicio` a essa janela automaticamente (com aviso em log) e
+retorna `[]` se a janela ficar vazia ou se a chave estiver ausente. Entrega
+corpo (`description` + `content`), então é a camada de *período recente com
+profundidade*.
+
+Ambas: requisição com `timeout` curto, filtro de whitelist por domínio,
+conversão UTC→SP, e em qualquer falha de rede/parse **retornam `[]`** (nunca
+levantam) — o ECON precisa rodar mesmo com uma fonte fora do ar. Cada uma tem
+cache próprio em pickle (TTL 24h, chave = hash da query + data_limite).
+
+### Deduplicação fuzzy entre fontes
+
+A mesma notícia costuma aparecer em várias fontes (Bloomberg publica, GDELT
+indexa, NewsAPI também). Antes a dedup era por **match exato** de título
+normalizado — frágil, porque "Petrobras anuncia dividendo recorde" e
+"Petrobras anuncia dividendo recorde hoje" escapavam como distintas.
+
+Agora a dedup é **fuzzy**: duas notícias são consideradas a mesma se a
+similaridade dos títulos normalizados (via `difflib.SequenceMatcher`, stdlib —
+sem nova dependência) for **> 0.85** *E* a diferença de publicação for
+**< 24h**. As notícias são processadas em ordem decrescente de peso, então a
+primeira de cada grupo é sempre a da fonte mais confiável; as duplicatas de
+menor peso são descartadas. Os limiares estão em `_DEDUP_SIM_MIN` e
+`_DEDUP_HORAS_MAX` no `journal.py`.
+
+### Resolução ticker → nome
+
+O ECON chama `get_noticias` passando um ticker (ex: `PETR4.SA`). Buscar pelo
+ticker cru rende poucos resultados; buscar por "Petrobras" rende muito mais.
+A tabela `TICKER_PARA_NOME` em `config.py` mapeia os 24 tickers do universo
+para o nome reconhecido da empresa, e `get_noticias` resolve o ticker para o
+nome antes de consultar as fontes.
+
 ### Anti-lookahead nas notícias
 
-`publishedAt` vem das APIs em UTC. Convertemos para `America/Sao_Paulo` antes
-de comparar. Qualquer notícia com `publicado_em > data_limite` é descartada.
-Para CSVs do Bloomberg, a coluna `data_publicacao` é tratada da mesma forma.
+`publishedAt`/`seendate` vêm das APIs em UTC. Convertemos para
+`America/Sao_Paulo` antes de comparar. Qualquer notícia com
+`publicado_em > data_limite` é descartada na coleta (filtro, não erro), e o
+`_assert_no_lookahead` final valida o conjunto antes de retornar. Para CSVs do
+Bloomberg, a coluna `data_publicacao` é tratada da mesma forma.
 
 ### Limitação documentada
 
@@ -291,7 +351,7 @@ gaps curtos (≤3 dias). Gaps maiores merecem atenção, não preenchimento.
 ### Por que migramos do yfinance para a CVM
 
 O yfinance entregava apenas os ~4 trimestres mais recentes — para o backtest
-2023-2024 e ainda mais para o treino 2020-2022, os dados frequentemente não
+2024-2025 e ainda mais para o treino 2020-2023, os dados frequentemente não
 existiam. A solução é integrar com a **CVM, fonte regulatória oficial**, que
 publica todos os ITRs (Informe Trimestral) e DFPs (anual) em formato aberto
 desde 2011 em `dados.cvm.gov.br/dados/CIA_ABERTA/DOC/`.
@@ -471,11 +531,30 @@ O IPCA mensal vem em variação percentual. Para acumulado 12m, compomos
 multiplicativamente: `(1 + ipca/100).prod() - 1`. Não é soma — é composição,
 correto para inflação.
 
+### Anti-lookahead do IPCA: data de publicação, não de referência
+
+O SGS indexa o IPCA pela **data de referência** (1º dia do mês), mas o índice
+só é **divulgado ~11 dias após o fim do mês** (o IPCA de maio sai por volta de
+11 de junho). Cortar pela data de referência (`index <= data_limite`) vazaria
+inflação que ainda não era pública — um lookahead sutil. Por isso o `get_macro`
+corta o IPCA pela **data de disponibilidade estimada** (`fim do mês + 11 dias`,
+constante `_LAG_IPCA_DIAS`), não pela referência. As séries diárias (Selic,
+PTAX) são divulgadas no próprio dia, então mantêm o corte pela data.
+
+**Limitação conhecida (séries diárias intradiárias):** Selic e PTAX são
+cortadas por dia. Como o JEMPO decide na abertura (10h) usando o fechamento de
+D-1, esse corte por dia é adequado na prática; um corte com granularidade de
+hora seria refinamento futuro se houver decisão intradia que dependa de PTAX do
+próprio dia (divulgada ~13h).
+
 ### Como defender na banca
 
 > "Os dados macroeconômicos vêm primariamente do BCB SGS, fonte oficial com
 > granularidade diária e sem latência de republicação. FRED foi
-> implementado como fallback automático para resiliência operacional."
+> implementado como fallback automático para resiliência operacional. Para o
+> IPCA, cortamos pela data de divulgação (~11 dias após o mês de referência),
+> não pela data de referência, evitando lookahead de inflação ainda não
+> publicada."
 
 ---
 
@@ -531,7 +610,7 @@ pergunta.
 `UNIVERSO_HISTORICO` em `config.py` é um dicionário onde cada ticker tem:
 - `setor`: classificação setorial padronizada.
 - `entrada`: data em que entrou no IBOV (ou None se já estava em 01/01/2019).
-- `saida`: data em que saiu (ou None se ainda está em 31/12/2024).
+- `saida`: data em que saiu (ou None se ainda está em 31/12/2025).
 - `confianca`: alta / média / baixa, sobre a precisão das datas.
 - `fonte`: de onde tiramos a informação.
 - `cd_cvm`: código CVM da companhia (necessário para o lookup de fundamentos).
@@ -553,21 +632,47 @@ tratamento de survivorship inclusive com casos emblemáticos como Americanas,
 para demonstrar que o sistema processa empresas que quebraram, não apenas
 sobreviventes.
 
-### Período coberto: 2019-2024
+### Período coberto: 2019-2025
 
 Por que 2019 e não 2020? Porque features de momentum usam **252 dias úteis
 (~1 ano)** de retorno passado. Para o treino começar efetivamente em 2020,
 precisamos de dados desde 2019. O universo precisa refletir composição do
 IBOV em todo esse período, não só do backtest.
 
+A periodização completa do sistema é:
+
+| Fase              | Período       | Justificativa |
+|-------------------|---------------|---------------|
+| Warmup            | 2019          | 252 dias úteis para momentum |
+| Calibração ECON   | 2020-2021     | Parâmetros do scoring |
+| Treino MATH&ML    | 2020-2023     | 4 anos com regime adverso (2022) e recuperação (2023) |
+| Backtest OOS      | 2024-2025     | Dados consolidados, condições recentes |
+
+### O caso AMER3 (Americanas) — argumento atualizado
+
+Americanas estava no IBOV até começo de 2023. Em 11/janeiro/2023, anunciou
+"inconsistências contábeis" de R$ 20 bilhões. Em 12/janeiro pediu recuperação
+extrajudicial. A ação despencou 80%+ em dias.
+
+Com `saida = 2023-01-12`, AMER3 está no universo até o último dia útil antes
+da quebra e some logo depois.
+
+**Com o backtest em 2024-2025, a quebra da Americanas (jan/2023) cai no
+período de TREINO.** Isso muda o argumento para a banca: o modelo **treinou
+vendo uma quebra real de empresa do IBOV** — aprendeu com o evento. O
+universo continua livre de survivorship bias em todo o período (2019-2025),
+pois AMER3 é incluída na janela ativa e excluída após a saída formal.
+
 ### Como defender na banca
 
 > "Implementamos universo histórico com membership por data — cada ticker
 > tem datas de entrada e saída do IBOV, e a qualquer momento da simulação
-> só consideramos tickers ativos naquela data. Cobrimos 2019-2024 (warmup +
-> treino + backtest). Incluímos casos emblemáticos como AMER3 (saída
-> 12/jan/2023, após pedido de RJ) para que o sistema processe empresas que
-> quebraram, não só as sobreviventes. Cada entrada tem também o cd_cvm para
+> só consideramos tickers ativos naquela data. Cobrimos 2019-2025 (warmup +
+> treino + backtest). O modelo treinou com AMER3 incluída no universo até
+> 12/jan/2023 — a quebra das Americanas ocorre no período de treino, não no
+> backtest, o que significa que o modelo aprendeu a lidar com esse tipo de
+> evento antes de ser avaliado fora da amostra. O universo é livre de
+> survivorship bias em todo o período. Cada entrada tem também o cd_cvm para
 > o lookup de fundamentos na CVM."
 
 ---
@@ -578,9 +683,8 @@ A banca pergunta as limitações. Negar é pior que admitir. Veja como
 apresentar cada uma:
 
 **1. NewsAPI gratuito cobre só 30 dias.** "Por isso a arquitetura em camadas:
-GDELT para o histórico (2015+), Wayback Machine para snapshots datados, e
-Bloomberg via CSV manual para os eventos mais importantes. NewsAPI
-complementa o período recente."
+GDELT para o histórico (2015+) e Bloomberg via CSV manual para os eventos
+mais importantes. NewsAPI complementa o período recente com corpo do artigo."
 
 **2. Bloomberg sem API e ToS proibindo scraping.** "Respeitamos os termos de
 uso. A integração é manual via CSV — incompatível com automação total, mas
@@ -606,6 +710,23 @@ inventamos número."
 **6. Bancos têm estrutura BPB diferente.** "Implementamos ramificação por
 setor no parser da CVM — bancos do universo (ITUB4, BBDC4) usam o esquema
 BPB ao invés de BPA+BPP. As métricas finais entregues são padronizadas."
+
+**7. Wayback Machine não implementada (avaliada, adiada).** "Avaliamos a
+Wayback Machine (web.archive.org) como fonte de snapshots datados de portais
+de notícia, mas optamos por não implementá-la nesta fase: a combinação
+GDELT (volume histórico desde 2015) + Bloomberg CSV (curadoria dos eventos
+críticos) + NewsAPI (período recente com corpo) já cobre bem a janela do
+backtest. A Wayback agregaria latência de acesso e complexidade de parsing
+de HTML arbitrário sem ganho proporcional de cobertura. Fica como melhoria
+futura caso identifiquemos lacunas concretas no histórico de um ticker."
+
+**8. Paginação das APIs de notícia não implementada.** "GDELT e NewsAPI são
+consultados com `maxrecords`/`pageSize` de 100 por requisição, sem paginação.
+Para a janela operacional do JOURNAL — `lookback` de 7 dias por ticker — 100
+artigos da whitelist por fonte são folgados (após o filtro de domínio sobra
+um punhado de notícias relevantes). Paginação fica como melhoria futura se
+surgir um caso limitante (ex: janela longa sobre um ticker de altíssima
+cobertura), onde implementaríamos o cursor de continuação de cada API."
 
 ---
 
@@ -671,8 +792,8 @@ do documento — mais preciso que lag heurístico.
 
 **P: Por que migraram para a CVM?**
 R: O yfinance entregava apenas os ~4 trimestres mais recentes, o que era
-insuficiente para um backtest histórico em 2023-2024 com treino em
-2020-2022. A CVM é a fonte regulatória oficial, com cobertura completa
+insuficiente para um backtest histórico em 2024-2025 com treino em
+2020-2023. A CVM é a fonte regulatória oficial, com cobertura completa
 desde 2011, e ainda agrega rigor metodológico pelo campo DT_RECEB. É a
 mesma fonte usada por gestoras profissionais.
 

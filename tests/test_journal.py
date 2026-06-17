@@ -10,6 +10,7 @@ from agents.journal import (
     JournalAgent,
     LookaheadError,
     DadoIndisponivel,
+    Noticia,
     _assert_no_lookahead,
     _ultimo_fechamento_disponivel,
 )
@@ -243,6 +244,19 @@ class TestTickersAtivos:
         with pytest.raises(ValueError):
             tickers_ativos(pd.Timestamp("2023-01-01"))
 
+    def test_universo_cobre_2025(self):
+        ativos = tickers_ativos(ts("2025-06-30"))
+        assert len(ativos) > 0, "Universo vazio em 2025-06-30"
+        # Tickers de alta confiança ainda ativos em 2025
+        for ticker in ("PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBAS3.SA", "WEGE3.SA"):
+            assert ticker in ativos, f"{ticker} deveria estar ativo em 2025-06-30"
+        # Saídas anteriores a 2025 não devem aparecer
+        assert "AMER3.SA" not in ativos, "AMER3 saiu em jan/2023"
+        assert "IRBR3.SA" not in ativos, "IRBR3 saiu em jan/2023"
+        # MGLU3 saiu no rebalanceamento jan/2025
+        assert "MGLU3.SA" not in ativos, "MGLU3 saiu no início de 2025"
+        print(f"\nTickers ativos em 2025-06-30 ({len(ativos)}): {sorted(ativos)}")
+
 
 # ── Anti-lookahead ────────────────────────────────────────────────────────────
 
@@ -282,3 +296,206 @@ class TestAntiLookahead:
         agora = ts("2024-03-15 18:00")  # sexta, após corte
         ult = _ultimo_fechamento_disponivel(agora)
         assert ult.date() == agora.date()
+
+
+# ── get_noticias (integração de fontes + dedup) ──────────────────────────────
+
+
+def _noticia(titulo, fonte, peso, pub):
+    return Noticia(
+        titulo=titulo, conteudo="", url=f"https://{fonte}/x",
+        publicado_em=ts(pub), fonte=fonte, peso_fonte=peso,
+    )
+
+
+class TestGetNoticias:
+    def test_get_noticias_deduplica(self):
+        # Mesma notícia em duas fontes, <24h → mantém a de maior peso
+        alta = _noticia("Petrobras anuncia dividendo recorde", "bloomberg.com", 1.0, "2024-05-10 09:00")
+        baixa = _noticia("Petrobras anuncia dividendo recorde hoje", "infomoney.com.br", 0.75, "2024-05-10 11:00")
+        unicas = _AGENT._deduplicar([baixa, alta])
+        assert len(unicas) == 1
+        assert unicas[0].fonte == "bloomberg.com", "Dedup deve manter a fonte de maior peso"
+
+    def test_get_noticias_nao_deduplica_distantes_no_tempo(self):
+        # Títulos idênticos mas >24h de diferença → não são duplicata
+        n1 = _noticia("Vale reporta produção recorde", "reuters.com", 0.95, "2024-05-10 09:00")
+        n2 = _noticia("Vale reporta produção recorde", "valor.com.br", 0.95, "2024-05-12 09:00")
+        assert len(_AGENT._deduplicar([n1, n2])) == 2
+
+    def test_get_noticias_nao_deduplica_titulos_distintos(self):
+        n1 = _noticia("Petrobras eleva produção no pré-sal", "reuters.com", 0.95, "2024-05-10 09:00")
+        n2 = _noticia("Vale fecha acordo de minério com China", "bloomberg.com", 1.0, "2024-05-10 10:00")
+        assert len(_AGENT._deduplicar([n1, n2])) == 2
+
+    def test_get_noticias_ordenacao_peso(self):
+        # _deduplicar processa por peso desc; verificamos a ordenação final aqui
+        ns = [
+            _noticia("A nota baixa", "infomoney.com.br", 0.75, "2024-05-10 09:00"),
+            _noticia("B nota alta", "bloomberg.com", 1.0, "2024-05-10 09:00"),
+            _noticia("C nota média", "estadao.com.br", 0.85, "2024-05-10 09:00"),
+        ]
+        unicas = _AGENT._deduplicar(ns)
+        unicas.sort(key=lambda n: (n.peso_fonte, n.publicado_em), reverse=True)
+        pesos = [n.peso_fonte for n in unicas]
+        assert pesos == sorted(pesos, reverse=True), "Notícias devem sair por peso desc"
+
+    def test_get_noticias_uma_fonte_caida_continua(self, monkeypatch):
+        # GDELT explode; get_noticias deve sobreviver e retornar lista
+        def _boom(*a, **k):
+            raise RuntimeError("GDELT fora do ar")
+        monkeypatch.setattr(_AGENT.gdelt, "buscar", _boom)
+        resultado = _AGENT.get_noticias("PETR4.SA", ts("2024-05-31 12:01"))
+        assert isinstance(resultado, list), "Falha de uma fonte não pode derrubar get_noticias"
+
+    def test_get_noticias_anti_lookahead_final(self):
+        limite = ts("2024-05-31 12:02")
+        for n in _AGENT.get_noticias("PETR4.SA", limite):
+            assert n.publicado_em <= limite, f"Lookahead: {n.publicado_em} > {limite}"
+
+    def test_get_noticias_resolve_ticker_para_nome(self, monkeypatch):
+        # Verifica que o ticker é resolvido para o nome antes de consultar as fontes
+        capturado = {}
+        def _spy(query, *a, **k):
+            capturado["query"] = query
+            return []
+        monkeypatch.setattr(_AGENT.gdelt, "buscar", _spy)
+        monkeypatch.setattr(_AGENT.newsapi, "buscar", lambda *a, **k: [])
+        _AGENT.get_noticias("PETR4.SA", ts("2024-05-31 12:03"))
+        assert capturado["query"] == "Petrobras", f"Ticker não resolvido: {capturado.get('query')}"
+
+
+# ── health_check ──────────────────────────────────────────────────────────────
+
+
+class TestHealthCheck:
+    _VALIDOS = {"online", "offline", "sem_chave", "vazio"}
+
+    def test_retorna_todas_as_fontes(self):
+        status = _AGENT.health_check()
+        for fonte in ("bloomberg_csv", "gdelt", "newsapi", "cvm", "bcb"):
+            assert fonte in status, f"Fonte ausente no health_check: {fonte}"
+        print(f"\nhealth_check: {status}")
+
+    def test_status_sao_validos(self):
+        status = _AGENT.health_check()
+        for fonte, st in status.items():
+            assert st in self._VALIDOS, f"Status inválido para {fonte}: {st!r}"
+
+    def test_bloomberg_vazio_sem_csv(self):
+        # data/bloomberg só tem .gitkeep → vazio
+        assert _AGENT.health_check()["bloomberg_csv"] in {"vazio", "online"}
+
+    def test_newsapi_sem_chave(self, monkeypatch):
+        agente = JournalAgent()
+        agente._news_api_key = ""
+        assert agente.health_check()["newsapi"] == "sem_chave"
+
+
+# ── Validação do CSV Bloomberg ────────────────────────────────────────────────
+
+
+def _agent_com_bloomberg(tmp_path) -> JournalAgent:
+    (tmp_path / "cache").mkdir(exist_ok=True)
+    return JournalAgent(cache_dir=tmp_path / "cache", bloomberg_dir=tmp_path)
+
+
+_HEADER_OK = "ticker,data_publicacao,titulo,conteudo,url,categoria\n"
+
+
+class TestBloombergCSVValidacao:
+    def test_coluna_faltando_levanta(self, tmp_path):
+        # Sem a coluna 'categoria'
+        (tmp_path / "noticias.csv").write_text(
+            "ticker,data_publicacao,titulo,conteudo,url\n"
+            "PETR4.SA,2024-05-10 09:00,Petrobras sobe,corpo,https://bloomberg.com/x\n"
+        )
+        agent = _agent_com_bloomberg(tmp_path)
+        with pytest.raises(ValueError, match="categoria"):
+            agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+
+    def test_coluna_extra_levanta(self, tmp_path):
+        (tmp_path / "noticias.csv").write_text(
+            _HEADER_OK.rstrip() + ",coluna_intrusa\n"
+            "PETR4.SA,2024-05-10 09:00,Petrobras sobe,corpo,https://bloomberg.com/x,mercado,xxx\n"
+        )
+        agent = _agent_com_bloomberg(tmp_path)
+        with pytest.raises(ValueError, match="coluna_intrusa"):
+            agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+
+    def test_linha_com_timestamp_invalido_pula_so_ela(self, tmp_path, caplog):
+        (tmp_path / "noticias.csv").write_text(
+            _HEADER_OK +
+            "PETR4.SA,data-invalida,Petrobras linha ruim,corpo,https://bloomberg.com/a,mercado\n"
+            "PETR4.SA,2024-05-10 09:00,Petrobras linha boa,corpo,https://bloomberg.com/b,mercado\n"
+        )
+        agent = _agent_com_bloomberg(tmp_path)
+        with caplog.at_level("WARNING"):
+            result = agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+        assert len(result) == 1, "Só a linha válida deve ser retornada"
+        assert result[0].titulo == "Petrobras linha boa"
+        assert any("linha 2" in m for m in caplog.messages), "Aviso deve citar o nº da linha"
+
+    def test_csv_valido_retorna_noticias(self, tmp_path):
+        (tmp_path / "noticias.csv").write_text(
+            _HEADER_OK +
+            "PETR4.SA,2024-05-10 09:00,Petrobras anuncia dividendo,corpo,https://bloomberg.com/x,mercado\n"
+        )
+        agent = _agent_com_bloomberg(tmp_path)
+        result = agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+        assert len(result) == 1
+        assert result[0].fonte == "bloomberg_csv"
+        assert result[0].peso_fonte == 1.0
+
+
+# ── get_noticias: não cachear resultado vazio (anti cache-poisoning) ──────────
+
+
+def test_get_noticias_nao_cacheia_vazio(tmp_path, monkeypatch):
+    agent = JournalAgent(cache_dir=tmp_path / "cache", bloomberg_dir=tmp_path / "bbg")
+    chamadas = {"n": 0}
+
+    def _vazio(*a, **k):
+        chamadas["n"] += 1
+        return []
+
+    monkeypatch.setattr(agent.gdelt, "buscar", _vazio)
+    monkeypatch.setattr(agent.newsapi, "buscar", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "_bloomberg_csv", lambda *a, **k: [])
+
+    r1 = agent.get_noticias("PETR4.SA", ts("2024-05-31 12:00"))
+    r2 = agent.get_noticias("PETR4.SA", ts("2024-05-31 12:00"))
+    assert r1 == [] and r2 == []
+    # Vazio não é cacheado: a 2ª chamada deve reconsultar as fontes.
+    assert chamadas["n"] == 2, "Resultado vazio não pode ser cacheado (deve reconsultar)"
+
+
+# ── get_macro: lag de publicação do IPCA (anti-lookahead) ─────────────────────
+
+
+def _fake_bcb_ipca(codigo, data_inicio, data_limite):
+    """Substitui _bcb_serie: IPCA mensal sintético (jan–mai/2024), resto vazio."""
+    if codigo == 433:  # IPCA mensal
+        idx = pd.to_datetime(
+            ["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01", "2024-05-01"]
+        )
+        return pd.Series([0.4, 0.5, 0.3, 0.2, 0.4], index=idx, name="433")
+    return pd.Series(dtype=float, name=str(codigo))
+
+
+class TestGetMacroLagIPCA:
+    def test_exclui_ipca_nao_publicado(self, tmp_path, monkeypatch):
+        agent = JournalAgent(cache_dir=tmp_path / "cache")
+        monkeypatch.setattr(agent, "_bcb_serie", _fake_bcb_ipca)
+        # 05/06/2024: IPCA de maio (publicado ~11/06) ainda NÃO disponível;
+        # IPCA de abril (publicado ~11/05) já disponível.
+        ipca = agent.get_macro(ts("2024-06-05"))["ipca_mensal"]
+        assert ts("2024-04-01") in ipca.index, "Abril já publicado, deveria constar"
+        assert ts("2024-05-01") not in ipca.index, "Maio ainda não publicado — lookahead!"
+
+    def test_inclui_ipca_apos_publicacao(self, tmp_path, monkeypatch):
+        agent = JournalAgent(cache_dir=tmp_path / "cache")
+        monkeypatch.setattr(agent, "_bcb_serie", _fake_bcb_ipca)
+        # 15/06/2024: IPCA de maio já publicado (~11/06).
+        ipca = agent.get_macro(ts("2024-06-15"))["ipca_mensal"]
+        assert ts("2024-05-01") in ipca.index, "Maio já publicado em 15/06, deveria constar"

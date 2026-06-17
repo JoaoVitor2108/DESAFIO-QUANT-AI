@@ -362,3 +362,63 @@ class TestTTM:
         assert resultado["patrimonio_liquido"] is not None, "Patrimônio PIT não deve ser None"
         assert resultado["caixa"] is not None, "Caixa PIT não deve ser None"
         print(f"\nSem DFP_prev:\n  receita={resultado['receita']}\n  patrimônio={resultado['patrimonio_liquido']/1e9:.1f}B\n  avisos={resultado['avisos'][:3]}")
+
+
+# ── Testes de periodicidade 2024-2025 ─────────────────────────────────────────
+
+
+class TestPeriodo2025:
+    """Valida que o sistema cobre o período de backtest 2024-2025."""
+
+    def test_cvm_fundamentals_2025(self):
+        """CVM deve baixar e parsear dados de 2024/2025 para PETR4."""
+        fund = _SRC.get_fundamentals(_CD_PETR4, ts("2025-06-01 17:00"))
+        assert fund is not None, "Sem dados CVM para PETR4 em 2025-06-01"
+        # Documento deve ser de 2024 ou 2025
+        assert fund["dt_refer"].year >= 2024, (
+            f"Esperado documento de 2024+, recebido {fund['dt_refer'].year}"
+        )
+        # DT_RECEB deve respeitar data_limite
+        assert fund["dt_receb"] <= ts("2025-06-01 17:00"), (
+            f"Lookahead: dt_receb={fund['dt_receb']} > data_limite=2025-06-01"
+        )
+        # Receita TTM deve ser centenas de bilhões (Petrobras)
+        if fund.get("receita") is not None:
+            assert fund["receita"] > 1e11, (
+                f"Receita suspeita (< R$ 100B): {fund['receita']/1e9:.1f}B"
+            )
+        print(
+            f"\nPETR4 em 2025-06-01:\n"
+            f"  trimestre = {fund['trimestre']}\n"
+            f"  dt_receb  = {fund['dt_receb'].date()}\n"
+            f"  receita   = {fund['receita'] and fund['receita']/1e9:.1f}B\n"
+            f"  avisos    = {fund['avisos'][:2]}"
+        )
+
+    def test_ttm_virada_de_ano_2024(self):
+        """data_limite jun/2024 → ITR Q1-2024 com DFP 2023 como base TTM.
+
+        Valida o caso de borda na fronteira treino (2020-2023) / backtest (2024-2025):
+        o sistema deve resolver ano_prev=2023 dinamicamente para calcular TTM.
+        """
+        fund = _SRC.get_fundamentals(_CD_PETR4, ts("2024-06-01 17:00"))
+        assert fund is not None, "Sem dados para PETR4 em 2024-06-01"
+        # Deve usar documento de 2024
+        assert "2024" in fund["trimestre"], (
+            f"Esperado documento de 2024, recebido: {fund['trimestre']}"
+        )
+        assert fund["tipo_doc"] == "ITR", (
+            f"Esperado ITR para fronteira Q1-2024, recebido {fund['tipo_doc']}"
+        )
+        # Se receita não é None, TTM foi calculado com DFP 2023 disponível
+        if fund.get("receita") is not None:
+            assert fund["receita"] > 1e11, (
+                f"Receita TTM suspeita: {fund['receita']/1e9:.1f}B"
+            )
+        print(
+            f"\nPETR4 virada treino→backtest (2024-06-01):\n"
+            f"  trimestre = {fund['trimestre']}\n"
+            f"  tipo_doc  = {fund['tipo_doc']}\n"
+            f"  receita   = {fund['receita'] and fund['receita']/1e9:.1f}B\n"
+            f"  avisos    = {fund['avisos'][:2]}"
+        )

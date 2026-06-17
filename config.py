@@ -5,17 +5,28 @@ import pandas as pd
 FUSO = "America/Sao_Paulo"
 LAG_FUNDAMENTALS_DIAS = 45  # mantido para fallback yfinance; CVM usa DT_RECEB
 HORARIO_CORTE_B3 = "17:05"
-INICIO_WARMUP = pd.Timestamp("2019-01-01", tz=FUSO)
-FIM_BACKTEST = pd.Timestamp("2024-12-31 23:59:59", tz=FUSO)
+
+# ── Periodização do sistema ───────────────────────────────────────────────────
+# Warmup:          2019          (momentum usa 252 dias úteis)
+# Calibração ECON: 2020-2021
+# Treino MATH&ML:  2020-2023     (4 anos, inclui regime adverso 2022 e recuperação 2023)
+# Backtest OOS:    2024-2025     (dados consolidados, condições de mercado recentes)
+INICIO_WARMUP            = pd.Timestamp("2019-01-01",          tz=FUSO)
+INICIO_CALIBRACAO_ECON   = pd.Timestamp("2020-01-01",          tz=FUSO)
+FIM_CALIBRACAO_ECON      = pd.Timestamp("2021-12-31 23:59:59", tz=FUSO)
+INICIO_TREINO            = pd.Timestamp("2020-01-01",          tz=FUSO)
+FIM_TREINO               = pd.Timestamp("2023-12-31 23:59:59", tz=FUSO)
+INICIO_BACKTEST          = pd.Timestamp("2024-01-01",          tz=FUSO)
+FIM_BACKTEST             = pd.Timestamp("2025-12-31 23:59:59", tz=FUSO)
 
 
 def _ts(date_str: str) -> pd.Timestamp:
     return pd.Timestamp(date_str, tz=FUSO)
 
 
-# Universo histórico: composição do IBOV ao longo de 2019-2024.
+# Universo histórico: composição do IBOV ao longo de 2019-2025.
 # entrada=None  → ticker já estava no índice em 01/01/2019.
-# saida=None    → ticker ainda estava no índice em 31/12/2024.
+# saida=None    → ticker ainda estava no índice em 31/12/2025.
 # cd_cvm        → código CVM (fonte: cad_cia_aberta.csv). Usado pelo CVMSource.
 # cnpj          → CNPJ da empresa (redundante, facilita joins com CVM).
 # Todos os timestamps são timezone-aware em America/Sao_Paulo.
@@ -203,12 +214,13 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "cd_cvm": 8133,
         "cnpj": "92.754.738/0001-62",
     },
+    # TODO: verificar data exata de exclusão — estimativa rebalanceamento jan/2025
     "MGLU3.SA": {
         "setor": "varejo",
         "entrada": None,
-        "saida": None,
-        "confianca": "alta",
-        "fonte": "B3 composição jan/2019",
+        "saida": _ts("2025-01-06"),
+        "confianca": "baixa",
+        "fonte": "B3 composição jan/2019; excluído IBOV ~jan/2025 (queda ~98% desde pico)",
         "cd_cvm": 22470,
         "cnpj": "47.960.950/0001-21",
     },
@@ -285,3 +297,52 @@ def tickers_ativos(data: pd.Timestamp) -> list[str]:
 MAPA_SETORES: dict[str, list[str]] = {}
 for _ticker, _info in UNIVERSO_HISTORICO.items():
     MAPA_SETORES.setdefault(_info["setor"], []).append(_ticker)
+
+
+# ── Fontes de notícia ─────────────────────────────────────────────────────────
+# Whitelist de domínios de imprensa econômica reconhecida → peso de confiança.
+# Apenas artigos destes domínios são aceitos; o peso entra no ranking e na
+# deduplicação (mantém-se a versão da fonte de maior peso). Casamento por
+# substring na URL/domínio (cobre www. e subdomínios).
+WHITELIST_FONTES: dict[str, float] = {
+    "bloomberg.com": 1.00,
+    "reuters.com": 0.95,
+    "valor.globo.com": 0.95,
+    "valor.com.br": 0.95,
+    "broadcast.com.br": 0.90,
+    "economia.estadao.com.br": 0.85,
+    "estadao.com.br": 0.85,
+    "exame.com": 0.75,
+    "infomoney.com.br": 0.75,
+    "moneytimes.com.br": 0.70,
+}
+
+# Tabela ticker → nome da empresa para montar queries de notícia.
+# Buscar pelo nome reconhecido retorna mais resultados que pelo ticker cru.
+# get_noticias resolve o ticker para o nome antes de consultar as fontes.
+TICKER_PARA_NOME: dict[str, str] = {
+    "PETR4.SA": "Petrobras",
+    "PRIO3.SA": "PRIO Petrorio",
+    "VALE3.SA": "Vale",
+    "CMIN3.SA": "CSN Mineração",
+    "WEGE3.SA": "WEG",
+    "GGBR4.SA": "Gerdau",
+    "ITUB4.SA": "Itaú Unibanco",
+    "BBDC4.SA": "Bradesco",
+    "BBAS3.SA": "Banco do Brasil",
+    "BPAC11.SA": "BTG Pactual",
+    "ABEV3.SA": "Ambev",
+    "JBSS3.SA": "JBS",
+    "ELET3.SA": "Eletrobras",
+    "EGIE3.SA": "Engie Brasil",
+    "SUZB3.SA": "Suzano",
+    "KLBN11.SA": "Klabin",
+    "VIVT3.SA": "Vivo Telefônica Brasil",
+    "RDOR3.SA": "Rede D'Or",
+    "LREN3.SA": "Lojas Renner",
+    "MGLU3.SA": "Magazine Luiza",
+    "AMER3.SA": "Americanas",
+    "CYRE3.SA": "Cyrela",
+    "TOTS3.SA": "Totvs",
+    "IRBR3.SA": "IRB Brasil Re",
+}

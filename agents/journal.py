@@ -15,6 +15,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -30,25 +31,38 @@ from config import (
     FUSO,
     INICIO_WARMUP,
     LAG_FUNDAMENTALS_DIAS,
+    TICKER_PARA_NOME,
     UNIVERSO_HISTORICO,
+    WHITELIST_FONTES,
     tickers_ativos,
 )
 from agents.sources.cvm import CVMSource
+from agents.sources.gdelt import GDELTSource
+from agents.sources.newsapi import NewsAPISource
+from agents.sources.noticia import Noticia
+
+# Limiares de deduplicação fuzzy de notícias
+_DEDUP_SIM_MIN = 0.85    # similaridade de título (SequenceMatcher) para considerar duplicata
+_DEDUP_HORAS_MAX = 24    # janela temporal máxima entre duplicatas
+
+# Colunas exatas esperadas no CSV manual do Bloomberg (data/bloomberg/*.csv)
+_BLOOMBERG_COLUNAS = ("ticker", "data_publicacao", "titulo", "conteudo", "url", "categoria")
+
+# IPCA é indexado no SGS pela data de referência (1º dia do mês), mas só é
+# divulgado ~11 dias após o fim do mês. Usamos esse lag para o corte
+# anti-lookahead (não a data de referência, que vazaria inflação futura).
+_LAG_IPCA_DIAS = 11
+
+# Endpoints usados pelo health_check (requisições leves, timeout curto)
+_HC_GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
+_HC_NEWSAPI = "https://newsapi.org/v2/everything"
+_HC_CVM = "https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
+_HC_BCB = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json"
 
 logger = logging.getLogger(__name__)
 
 _CORTE_HORA = 17
 _CORTE_MIN = 5
-
-_WHITELIST_PESOS: dict[str, float] = {
-    "bloomberg.com": 1.00,
-    "reuters.com": 0.95,
-    "valor.globo.com": 0.95,
-    "valor.com.br": 0.90,
-    "broadcast.com.br": 0.90,
-    "estadao.com.br": 0.85,
-    "infomoney.com.br": 0.75,
-}
 
 # ── Exceções ─────────────────────────────────────────────────────────────────
 
@@ -62,17 +76,6 @@ class DadoIndisponivel(Exception):
 
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Noticia:
-    titulo: str
-    conteudo: str
-    url: str
-    publicado_em: pd.Timestamp  # timezone-aware, America/Sao_Paulo
-    fonte: str
-    peso_fonte: float
-    ticker: Optional[str] = None
 
 
 @dataclass
@@ -193,13 +196,6 @@ def _normalizar_titulo(titulo: str) -> str:
     return t[:80]
 
 
-def _peso_url(url: str) -> Optional[float]:
-    for domain, peso in _WHITELIST_PESOS.items():
-        if domain in url:
-            return peso
-    return None
-
-
 # ── JournalAgent ──────────────────────────────────────────────────────────────
 
 
@@ -214,6 +210,76 @@ class JournalAgent:
         self._news_api_key = os.getenv("NEWS_API_KEY", "")
         self._fred_api_key = os.getenv("FRED_API_KEY", "")
 
+        # Fontes de notícia especializadas (mesmo padrão modular do CVMSource)
+        self.gdelt = GDELTSource(cache_dir, WHITELIST_FONTES)
+        self.newsapi = NewsAPISource(cache_dir, WHITELIST_FONTES, self._news_api_key)
+
+    # ── 0. Health check ───────────────────────────────────────────────────────
+
+    def health_check(self, timeout: int = 3) -> dict[str, str]:
+        """Status de cada fonte de dados, para diagnóstico antes de um backtest.
+
+        Retorna dict {fonte: status} com status em:
+          "online"   — respondeu OK a uma requisição leve;
+          "offline"  — sem resposta, erro de rede ou status != 200;
+          "sem_chave"— fonte exige API key e ela não está configurada;
+          "vazio"    — fonte local sem dados (ex: Bloomberg sem CSV).
+
+        Requisições usam timeout curto (default 3s) e payload mínimo.
+        """
+        status = {
+            "bloomberg_csv": self._health_bloomberg(),
+            "gdelt": self._ping(
+                _HC_GDELT,
+                params={"query": "test", "mode": "ArtList", "format": "json", "maxrecords": "1"},
+                timeout=timeout,
+            ),
+            "newsapi": (
+                "sem_chave" if not self._news_api_key
+                else self._ping(
+                    _HC_NEWSAPI,
+                    params={"q": "test", "pageSize": "1", "apiKey": self._news_api_key},
+                    timeout=timeout,
+                )
+            ),
+            "cvm": self._ping(_HC_CVM, timeout=timeout, stream=True),
+            "bcb": self._ping(_HC_BCB, timeout=timeout),
+        }
+        logger.info("health_check: %s", status)
+        return status
+
+    def _health_bloomberg(self) -> str:
+        """Status do CSV manual do Bloomberg: vazio/online/offline."""
+        if not self._bloomberg_dir.exists():
+            return "vazio"
+        csvs = list(self._bloomberg_dir.glob("*.csv"))
+        if not csvs:
+            return "vazio"
+        try:
+            df = pd.read_csv(csvs[0], dtype=str, nrows=0)
+            return "online" if set(df.columns) == set(_BLOOMBERG_COLUNAS) else "offline"
+        except Exception as e:
+            logger.warning("health_check Bloomberg: falha lendo %s: %s", csvs[0].name, e)
+            return "offline"
+
+    @staticmethod
+    def _ping(url: str, params: dict | None = None, timeout: int = 3, stream: bool = False) -> str:
+        """Requisição leve a uma URL: 'online' se respondeu, senão 'offline'.
+
+        Status 200 = online. Status 429 (rate limit) também conta como online:
+        o servidor está vivo, apenas limitando a taxa momentaneamente.
+        """
+        try:
+            resp = requests.get(url, params=params, timeout=timeout, stream=stream)
+            ok = resp.status_code in (200, 429)
+            if stream:
+                resp.close()
+            logger.debug("health_check ping %s -> %s", url, resp.status_code)
+            return "online" if ok else "offline"
+        except Exception as e:
+            logger.debug("health_check ping %s falhou: %s", url, e)
+            return "offline"
+
     # ── 1. Notícias ───────────────────────────────────────────────────────────
 
     def get_noticias(
@@ -222,54 +288,106 @@ class JournalAgent:
         data_limite: pd.Timestamp,
         lookback_days: int = 7,
     ) -> list[Noticia]:
-        """Coleta notícias de múltiplas fontes com dedup e peso por fonte.
+        """Coleta notícias de múltiplas fontes, deduplica e ordena por peso.
 
-        Ordem de prioridade: Bloomberg CSV > Reuters/Valor via GDELT >
-        GDELT geral > NewsAPI. Apenas fontes da whitelist são aceitas.
+        Fontes em cascata: Bloomberg CSV (curadoria manual, peso máximo) >
+        GDELT (volume histórico desde 2015) > NewsAPI (período recente com
+        corpo). Cada fonte é isolada: se uma cair, as demais seguem. Só
+        domínios da whitelist são aceitos.
+
+        `query` pode ser um ticker (ex: "PETR4.SA") — nesse caso é resolvido
+        para o nome da empresa via TICKER_PARA_NOME, que rende mais resultados.
         """
         _validate_aware(data_limite, "data_limite")
+        query = TICKER_PARA_NOME.get(query, query)
         cache_key = {"q": query, "dl": str(data_limite), "lb": lookback_days}
         cached = self._cache.get("get_noticias", cache_key)
         if cached is not None:
+            logger.info("get_noticias('%s'): cache hit (%d notícias)", query, len(cached))
             return cached
+        logger.info("get_noticias('%s', até %s): cache miss, consultando fontes",
+                    query, data_limite.date())
 
         data_inicio = data_limite - pd.Timedelta(days=lookback_days)
-        noticias: list[Noticia] = []
-        vistos: set[str] = set()
+        todas: list[Noticia] = []
 
-        def _add(n: Noticia) -> None:
-            chave = _normalizar_titulo(n.titulo)
-            if not chave or chave in vistos:
-                return
-            if n.publicado_em > data_limite:
-                return
-            vistos.add(chave)
-            noticias.append(n)
+        def _coletar(nome_fonte: str, fn) -> None:
+            """Executa uma fonte isolada: erro nela não derruba as demais."""
+            try:
+                for n in fn():
+                    if n.publicado_em <= data_limite:   # filtro anti-lookahead
+                        todas.append(n)
+            except Exception as e:
+                logger.warning("Fonte de notícia %s falhou: %s", nome_fonte, e)
 
-        # Camada 1 — Bloomberg CSV (peso máximo)
-        for n in self._bloomberg_csv(query, data_inicio, data_limite):
-            _add(n)
+        # Camada 1 — Bloomberg CSV (curadoria manual, peso máximo)
+        _coletar("bloomberg_csv", lambda: self._bloomberg_csv(query, data_inicio, data_limite))
+        # Camada 2 — GDELT (volume histórico)
+        _coletar("gdelt", lambda: self.gdelt.buscar(query, data_inicio, data_limite))
+        # Camada 3 — NewsAPI (período recente; clampa 30 dias internamente)
+        _coletar("newsapi", lambda: self.newsapi.buscar(query, data_inicio, data_limite))
 
-        # Camada 2 — Reuters e Valor via GDELT com filtro de domínio
-        for domain in ("reuters.com", "valor.globo.com", "valor.com.br"):
-            for n in self._gdelt(f"{query} domain:{domain}", data_inicio, data_limite):
-                _add(n)
-
-        # Camada 3 — GDELT geral (apenas whitelist)
-        for n in self._gdelt(query, data_inicio, data_limite):
-            _add(n)
-
-        # Camada 4 — NewsAPI (plano free: últimos 30 dias)
-        if self._news_api_key:
-            cutoff_news = data_limite - pd.Timedelta(days=30)
-            inicio_news = max(data_inicio, cutoff_news)
-            for n in self._newsapi(query, inicio_news, data_limite):
-                _add(n)
-
+        noticias = self._deduplicar(todas)
+        # Ordenar: maior peso primeiro, mais recente primeiro
         noticias.sort(key=lambda n: (n.peso_fonte, n.publicado_em), reverse=True)
         _assert_no_lookahead(noticias, data_limite, "get_noticias")
-        self._cache.set("get_noticias", cache_key, noticias)
+        # Só cacheia resultado não-vazio: um [] quase sempre indica falha
+        # transitória de fonte (ex: 429 do GDELT), e cacheá-lo por 24h
+        # propagaria a falha. Vazio é barato de recomputar.
+        if noticias:
+            self._cache.set("get_noticias", cache_key, noticias)
+            logger.info("get_noticias('%s'): %d notícias (%d brutas antes da dedup)",
+                        query, len(noticias), len(todas))
+        else:
+            logger.info("get_noticias('%s'): resultado vazio, não cacheado", query)
         return noticias
+
+    def _deduplicar(self, noticias: list[Noticia]) -> list[Noticia]:
+        """Remove notícias duplicadas entre fontes, mantendo a de maior peso.
+
+        Critério de duplicata: similaridade de título (SequenceMatcher sobre
+        títulos normalizados) acima de _DEDUP_SIM_MIN E diferença de publicação
+        menor que _DEDUP_HORAS_MAX. Processa em ordem decrescente de peso para
+        que a primeira de cada grupo seja sempre a da fonte mais confiável.
+        """
+        ordenadas = sorted(noticias, key=lambda n: n.peso_fonte, reverse=True)
+        resultado: list[Noticia] = []
+        for n in ordenadas:
+            titulo_n = _normalizar_titulo(n.titulo)
+            duplicata = False
+            for r in resultado:
+                sim = SequenceMatcher(None, titulo_n, _normalizar_titulo(r.titulo)).ratio()
+                if sim > _DEDUP_SIM_MIN:
+                    diff_horas = abs((n.publicado_em - r.publicado_em).total_seconds()) / 3600
+                    if diff_horas < _DEDUP_HORAS_MAX:
+                        duplicata = True
+                        break
+            if not duplicata:
+                resultado.append(n)
+        return resultado
+
+    @staticmethod
+    def _validar_colunas_bloomberg(df: pd.DataFrame, nome_arquivo: str) -> None:
+        """Valida que o CSV tem exatamente as colunas esperadas.
+
+        Levanta ValueError com mensagem clara apontando quais colunas estão
+        faltando ou sobrando. Estrutura errada é erro de dado, não algo a
+        ignorar silenciosamente.
+        """
+        presentes = set(df.columns)
+        esperadas = set(_BLOOMBERG_COLUNAS)
+        faltando = esperadas - presentes
+        extras = presentes - esperadas
+        if faltando or extras:
+            partes = []
+            if faltando:
+                partes.append(f"faltando {sorted(faltando)}")
+            if extras:
+                partes.append(f"inesperadas {sorted(extras)}")
+            raise ValueError(
+                f"CSV Bloomberg '{nome_arquivo}' com colunas inválidas: "
+                f"{'; '.join(partes)}. Esperado exatamente: {list(_BLOOMBERG_COLUNAS)}"
+            )
 
     def _bloomberg_csv(
         self,
@@ -282,136 +400,40 @@ class JournalAgent:
             return result
         termos = query.lower().split()
         for csv_path in self._bloomberg_dir.glob("*.csv"):
-            try:
-                df = pd.read_csv(csv_path, dtype=str).fillna("")
-                for _, row in df.iterrows():
-                    try:
-                        pub = pd.Timestamp(row.get("data_publicacao", ""))
-                        if pub.tzinfo is None:
-                            pub = pub.tz_localize(FUSO)
-                        else:
-                            pub = pub.tz_convert(FUSO)
-                    except Exception:
-                        continue
-                    if not (data_inicio <= pub <= data_limite):
-                        continue
-                    titulo = row.get("titulo", "")
-                    conteudo = row.get("conteudo", "")
-                    if termos and not any(t in f"{titulo} {conteudo}".lower() for t in termos):
-                        continue
-                    result.append(Noticia(
-                        titulo=titulo,
-                        conteudo=conteudo,
-                        url=row.get("url", ""),
-                        publicado_em=pub,
-                        fonte="bloomberg_csv",
-                        peso_fonte=1.0,
-                        ticker=row.get("ticker") or None,
-                    ))
-            except Exception as e:
-                logger.warning("Erro lendo Bloomberg CSV %s: %s", csv_path.name, e)
-        return result
-
-    def _gdelt(
-        self,
-        query: str,
-        data_inicio: pd.Timestamp,
-        data_limite: pd.Timestamp,
-    ) -> list[Noticia]:
-        """Consulta GDELT DocSearch v2. Retorna apenas artigos da whitelist."""
-        fmt = "%Y%m%d%H%M%S"
-        try:
-            resp = requests.get(
-                "https://api.gdeltproject.org/api/v2/doc/doc",
-                params={
-                    "query": query,
-                    "mode": "artlist",
-                    "maxrecords": "250",
-                    "format": "json",
-                    "startdatetime": data_inicio.strftime(fmt),
-                    "enddatetime": data_limite.strftime(fmt),
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("GDELT falhou para query '%s': %s", query[:60], e)
-            return []
-
-        result: list[Noticia] = []
-        for art in data.get("articles", []):
-            url = art.get("url", "")
-            peso = _peso_url(url)
-            if peso is None:
-                continue  # descarte: fora da whitelist
-            try:
-                # GDELT seendate: "20230115T103000Z"
-                raw = art.get("seendate", "")
-                pub = pd.Timestamp(
-                    year=int(raw[0:4]), month=int(raw[4:6]), day=int(raw[6:8]),
-                    hour=int(raw[9:11]), minute=int(raw[11:13]), second=int(raw[13:15]),
-                    tz="UTC",
-                ).tz_convert(FUSO)
-            except Exception:
+            df = pd.read_csv(csv_path, dtype=str).fillna("")
+            self._validar_colunas_bloomberg(df, csv_path.name)
+            logger.debug("Bloomberg CSV %s: %d linhas", csv_path.name, len(df))
+            for idx, row in df.iterrows():
+                raw = row.get("data_publicacao", "")
                 try:
-                    pub = pd.Timestamp(art.get("seendate", "")).tz_convert(FUSO)
+                    pub = pd.Timestamp(raw)
+                    if pub.tzinfo is None:
+                        pub = pub.tz_localize(FUSO)
+                    else:
+                        pub = pub.tz_convert(FUSO)
                 except Exception:
+                    # Linha com timestamp inválido: avisa (com nº da linha no
+                    # arquivo, +2 = cabeçalho + base 1) e pula só esta linha.
+                    logger.warning(
+                        "Bloomberg CSV %s linha %d: data_publicacao inválida %r; pulando linha",
+                        csv_path.name, idx + 2, raw,
+                    )
                     continue
-            result.append(Noticia(
-                titulo=art.get("title", ""),
-                conteudo="",  # GDELT não entrega corpo do artigo
-                url=url,
-                publicado_em=pub,
-                fonte="gdelt",
-                peso_fonte=peso,
-            ))
-        return result
-
-    def _newsapi(
-        self,
-        query: str,
-        data_inicio: pd.Timestamp,
-        data_limite: pd.Timestamp,
-    ) -> list[Noticia]:
-        try:
-            resp = requests.get(
-                "https://newsapi.org/v2/everything",
-                params={
-                    "q": query,
-                    "from": data_inicio.date().isoformat(),
-                    "to": data_limite.date().isoformat(),
-                    "language": "pt",
-                    "sortBy": "publishedAt",
-                    "pageSize": "100",
-                    "apiKey": self._news_api_key,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("NewsAPI falhou para '%s': %s", query[:60], e)
-            return []
-
-        result: list[Noticia] = []
-        for art in data.get("articles", []):
-            url = art.get("url", "")
-            peso = _peso_url(url)
-            if peso is None:
-                continue
-            try:
-                pub = pd.Timestamp(art["publishedAt"]).tz_convert(FUSO)
-            except Exception:
-                continue
-            result.append(Noticia(
-                titulo=art.get("title", "") or "",
-                conteudo=art.get("description", "") or "",
-                url=url,
-                publicado_em=pub,
-                fonte="newsapi",
-                peso_fonte=peso,
-            ))
+                if not (data_inicio <= pub <= data_limite):
+                    continue
+                titulo = row.get("titulo", "")
+                conteudo = row.get("conteudo", "")
+                if termos and not any(t in f"{titulo} {conteudo}".lower() for t in termos):
+                    continue
+                result.append(Noticia(
+                    titulo=titulo,
+                    conteudo=conteudo,
+                    url=row.get("url", ""),
+                    publicado_em=pub,
+                    fonte="bloomberg_csv",
+                    peso_fonte=1.0,
+                    ticker=row.get("ticker") or None,
+                ))
         return result
 
     # ── 2. Preços ─────────────────────────────────────────────────────────────
@@ -682,7 +704,9 @@ class JournalAgent:
         else:
             result["ipca_12m"] = pd.Series(dtype=float, name="ipca_12m")
 
-        # Garantir timezone-aware e cortar por data_limite
+        # Garantir timezone-aware e cortar por data_limite.
+        # IPCA usa data de DISPONIBILIDADE (publicação ~11 dias após o fim do
+        # mês de referência); as demais (diárias) usam a própria data.
         for nome, serie in result.items():
             if serie.empty:
                 continue
@@ -690,7 +714,13 @@ class JournalAgent:
                 serie.index = serie.index.tz_localize(FUSO)
             else:
                 serie.index = serie.index.tz_convert(FUSO)
-            result[nome] = serie[serie.index <= data_limite]
+            if nome in ("ipca_mensal", "ipca_12m"):
+                disponivel_em = (
+                    serie.index + pd.offsets.MonthEnd(0) + pd.Timedelta(days=_LAG_IPCA_DIAS)
+                )
+                result[nome] = serie[disponivel_em <= data_limite]
+            else:
+                result[nome] = serie[serie.index <= data_limite]
 
         self._cache.set("get_macro", cache_key, result)
         return result
