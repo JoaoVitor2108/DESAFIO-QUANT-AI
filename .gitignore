@@ -1,4 +1,4 @@
-# Chaves e segredos
+# Chaves e segredos (as chaves reais ficam em .env — ver .env.example)
 .env
 .env.local
 *.key
@@ -23,6 +23,9 @@ data/cvm/processed/
 # Saídas do backtest
 backtest/reports/*.png
 backtest/reports/*.html
+
+# Documento de estratégia (mantido fora do repositório público)
+/jempo_estrategia_final.pdf
 
 # Sistema
 .DS_Store
