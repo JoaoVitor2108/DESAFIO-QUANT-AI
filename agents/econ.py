@@ -43,7 +43,7 @@ _MAX_TOKENS = 1024
 # calibração (≤10 iterações), avaliações antigas NÃO podem ser reusadas, senão
 # compararíamos IC de um prompt novo com saídas cacheadas do prompt antigo.
 # REGRA: faça bump sempre que `_SYSTEM_PROMPT` ou `_TOOL`/schema mudarem.
-_PROMPT_VERSION = "2024-06-econA"
+_PROMPT_VERSION = "2026-06-econA"
 
 # Teto de notícias enviadas ao LLM. Justificativa: a janela operacional é de 7
 # dias por ticker; após o filtro de whitelist do JOURNAL sobram poucas notícias
@@ -57,7 +57,9 @@ _MAX_CONTEUDO_CHARS = 800
 
 # Limiar da checagem de sanidade (Opção A): sob a semântica nova, `score_total`
 # deve ficar próximo de `comp_noticia` (sua base). Divergência maior gera aviso.
-_DIVERGENCIA_MAX = 0.5
+# 0.25 num range [-1,+1] = tolera 1/8 da escala (0.5 tolerava metade — frouxo).
+# TODO(calibração): medir abs(score_total - comp_noticia) típico e recalibrar.
+_DIVERGENCIA_MAX = 0.25
 
 
 # ── Contrato de saída ─────────────────────────────────────────────────────────
@@ -78,6 +80,8 @@ class ScoreEcon:
     justificativa: str                   # raciocínio curto
     modelo: str                          # rastreabilidade
     avisos: list[str] = field(default_factory=list)
+    data_noticia_mais_recente: Optional[pd.Timestamp] = None  # p/ rastreabilidade + D+1/D+2 no ORQUESTRADOR
+    noticias_hashes: list[str] = field(default_factory=list)  # hash individual de cada notícia avaliada (auditoria)
 
 
 # ── Schema da ferramenta (tool use forçado, sem parsing de texto livre) ───────
@@ -156,14 +160,25 @@ def _clamp(x, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, v)))
 
 
+def _hash_noticia(n: Noticia) -> str:
+    """Hash determinístico de UMA notícia (rastreabilidade individual)."""
+    chave = f"{n.fonte}|{n.publicado_em.isoformat()}|{n.titulo}"
+    return hashlib.sha256(chave.encode()).hexdigest()[:16]
+
+
 def _hash_noticias(noticias: list[Noticia]) -> str:
     """Hash determinístico do conjunto de notícias (para a chave de cache)."""
-    chaves = sorted(f"{n.fonte}|{n.publicado_em.isoformat()}|{n.titulo}" for n in noticias)
-    raw = "||".join(chaves)
+    raw = "||".join(sorted(_hash_noticia(n) for n in noticias))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _neutro(ticker, data_limite, n_noticias, justificativa, avisos, modelo) -> ScoreEcon:
+def _data_mais_recente(noticias: list[Noticia]):
+    """Data da notícia mais recente do conjunto (None se vazio)."""
+    return max((n.publicado_em for n in noticias), default=None)
+
+
+def _neutro(ticker, data_limite, n_noticias, justificativa, avisos, modelo,
+            data_noticia=None, noticias_hashes=None) -> ScoreEcon:
     return ScoreEcon(
         ticker=ticker,
         data_referencia=data_limite,
@@ -178,6 +193,8 @@ def _neutro(ticker, data_limite, n_noticias, justificativa, avisos, modelo) -> S
         justificativa=justificativa,
         modelo=modelo,
         avisos=list(avisos),
+        data_noticia_mais_recente=data_noticia,
+        noticias_hashes=list(noticias_hashes or []),
     )
 
 
@@ -227,14 +244,20 @@ class EconAgent:
         lookback_days: int = 7,
         noticias_override: Optional[list[Noticia]] = None,
         nome_override: Optional[str] = None,
+        incluir_contexto_fundamental: bool = True,
     ) -> ScoreEcon:
         """Avalia o impacto econômico das notícias de `ticker` até `data_limite`.
 
-        `noticias_override` e `nome_override` são hooks de calibração (default
-        None = comportamento normal): permitem ao teste de placebo fornecer
-        notícias já anonimizadas e substituir o nome da empresa, reusando todo o
-        pipeline. Fundamentos/macro continuam vindo do ticker real (preserva o
-        mecanismo econômico; esconde a identidade da empresa).
+        Hooks de calibração (default = comportamento normal):
+        - `noticias_override`: usa estas notícias (já anonimizadas) em vez do JOURNAL.
+        - `nome_override`: substitui o nome da empresa apresentado ao LLM.
+        - `incluir_contexto_fundamental=False`: oculta fundamentos/setor/macro do
+          payload (modo "identidade_pura" do placebo — mede se o sinal vem do texto
+          ou da memória do modelo sobre a empresa).
+
+        Para o placebo "swap completo", a calibração chama `avaliar` com o TICKER
+        do par substituto B (e notícias com o nome trocado A→B): assim
+        `_montar_contexto` busca fundamentos/setor/macro de B naturalmente.
         """
         _validate_aware(data_limite, "data_limite")
 
@@ -249,15 +272,19 @@ class EconAgent:
             return _neutro(ticker, data_limite, 0, "sem notícia relevante", [], self.model)
 
         noticias = noticias[:_MAX_NOTICIAS]
+        data_noticia = _data_mais_recente(noticias)
+        hashes = [_hash_noticia(n) for n in noticias]
 
-        # 3. Cache por (ticker, data, modelo, versão do prompt, conjunto de notícias).
-        # nome_override entra na chave: placebo e avaliação real não compartilham cache.
+        # 3. Cache por (ticker, data, modelo, versão do prompt, contexto, notícias).
+        # nome_override e o flag de contexto entram na chave: placebo (qualquer modo)
+        # e avaliação real não compartilham cache.
         cache_key = {
             "t": ticker,
             "dl": str(data_limite.date()),
             "m": self.model,
             "pv": _PROMPT_VERSION,
             "nome": nome_override or "",
+            "ctx": int(incluir_contexto_fundamental),
             "h": _hash_noticias(noticias),
         }
         cached = self._cache.get("econ_avaliar", cache_key)
@@ -271,13 +298,14 @@ class EconAgent:
                 ticker, data_limite, len(noticias),
                 "avaliação indisponível (sem chave da API)",
                 ["ANTHROPIC_API_KEY ausente ou cliente indisponível; score neutro."],
-                self.model,
+                self.model, data_noticia=data_noticia, noticias_hashes=hashes,
             )
 
         # 5. Coletar contexto fundamental/macro/setorial (tolerante a falha)
         avisos: list[str] = []
         contexto = self._montar_contexto(ticker, data_limite, noticias, avisos,
-                                         nome_override=nome_override)
+                                         nome_override=nome_override,
+                                         incluir_contexto_fundamental=incluir_contexto_fundamental)
 
         # 6. Chamar o Claude (tool use forçado) e parsear
         try:
@@ -296,7 +324,7 @@ class EconAgent:
                 ticker, data_limite, len(noticias),
                 "avaliação indisponível (erro de API)",
                 avisos + [f"erro na chamada ao Claude: {e}"],
-                self.model,
+                self.model, data_noticia=data_noticia, noticias_hashes=hashes,
             )
 
         score = self._parsear(ticker, data_limite, noticias, resposta, avisos)
@@ -307,7 +335,7 @@ class EconAgent:
                 ticker, data_limite, len(noticias),
                 "avaliação indisponível (resposta sem tool_use)",
                 avisos + ["resposta do Claude não contém bloco tool_use válido."],
-                self.model,
+                self.model, data_noticia=data_noticia, noticias_hashes=hashes,
             )
         self._cache.set("econ_avaliar", cache_key, score)
         return score
@@ -315,25 +343,20 @@ class EconAgent:
     # ── Internos ──────────────────────────────────────────────────────────────
 
     def _montar_contexto(self, ticker, data_limite, noticias, avisos: list[str],
-                         nome_override: Optional[str] = None) -> str:
+                         nome_override: Optional[str] = None,
+                         incluir_contexto_fundamental: bool = True) -> str:
         """Monta o payload textual (JSON) enviado ao LLM a partir do JOURNAL.
 
-        `nome_override` (placebo): substitui o nome da empresa apresentado ao LLM,
-        sem mudar a fonte dos fundamentos/macro (que vêm do ticker real).
+        `nome_override` (placebo): substitui o nome da empresa apresentado ao LLM.
+        `incluir_contexto_fundamental=False` (placebo "identidade_pura"): omite
+        fundamentos/setor/macro/retornos do payload — fica só o texto da notícia.
         """
         empresa = nome_override or TICKER_PARA_NOME.get(ticker, ticker)
-        setor = UNIVERSO_HISTORICO.get(ticker, {}).get("setor")
-        if setor is None:
-            try:
-                setor = self.journal.get_setor(ticker)
-            except Exception as e:
-                avisos.append(f"setor indisponível: {e}")
 
         payload = {
             "data_limite": str(data_limite),
             "ticker": ticker,
             "empresa": empresa,
-            "setor": setor,
             "noticias": [
                 {
                     "titulo": n.titulo,
@@ -345,6 +368,23 @@ class EconAgent:
                 for n in noticias
             ],
         }
+
+        if not incluir_contexto_fundamental:
+            # identidade_pura: sem fundamentos/setor/macro — esconde a empresa.
+            return (
+                "Avalie a ação com base apenas no texto das notícias abaixo "
+                "(todos ex-ante à data_limite). Responda chamando a ferramenta "
+                "registrar_avaliacao.\n\n"
+                + json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+            )
+
+        setor = UNIVERSO_HISTORICO.get(ticker, {}).get("setor")
+        if setor is None:
+            try:
+                setor = self.journal.get_setor(ticker)
+            except Exception as e:
+                avisos.append(f"setor indisponível: {e}")
+        payload["setor"] = setor
 
         # Fundamentos (tolerante a falha)
         try:
@@ -425,4 +465,6 @@ class EconAgent:
             justificativa=str(dados.get("justificativa", "")).strip(),
             modelo=self.model,
             avisos=avisos,
+            data_noticia_mais_recente=_data_mais_recente(noticias),
+            noticias_hashes=[_hash_noticia(n) for n in noticias],
         )

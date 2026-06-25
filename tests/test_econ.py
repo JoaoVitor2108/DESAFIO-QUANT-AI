@@ -291,3 +291,106 @@ def test_nome_override_no_contexto(tmp_path):
 
     assert "EMPRESA_ANON" in contexto
     assert "Petrobras" not in contexto
+
+
+# ── P2 (v3): identidade_pura — omitir contexto fundamental ─────────────────────
+
+
+def test_sem_contexto_fundamental_omite_fundamentos(tmp_path):
+    journal = _journal_mock([_noticia()])
+    agent = EconAgent(journal=journal, client=_client_mock(_TOOL_OK), cache_dir=tmp_path)
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [],
+                                      incluir_contexto_fundamental=False)
+
+    assert "fundamentos" not in contexto
+    assert "macro" not in contexto
+    assert "retornos_setor" not in contexto
+    journal.get_fundamentals.assert_not_called()
+    journal.get_macro.assert_not_called()
+    journal.get_retornos_setor.assert_not_called()
+
+
+def test_com_contexto_fundamental_inclui_fundamentos(tmp_path):
+    agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "fundamentos" in contexto and "macro" in contexto
+
+
+# ── P3 (v3): isolamento físico — avaliar nunca busca preços ────────────────────
+
+
+def test_avaliar_nunca_busca_precos(tmp_path):
+    journal = _journal_mock([_noticia()])
+    agent = EconAgent(journal=journal, client=_client_mock(_TOOL_OK), cache_dir=tmp_path)
+
+    agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    # get_precos só é usado na MEDIÇÃO DE ALVO EX-POST da calibração, nunca no
+    # caminho de decisão — senão preços pós-data_limite vazariam para o payload.
+    journal.get_precos.assert_not_called()
+
+
+# ── P5 (v3): limiar de divergência apertado para 0.25 ──────────────────────────
+
+
+def test_divergencia_no_novo_limiar_gera_aviso(tmp_path):
+    # diff = 0.3: aviso com _DIVERGENCIA_MAX=0.25 (não geraria com o antigo 0.5)
+    fora = dict(_TOOL_OK, score_total=0.4, componente_noticia=0.1)
+    agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(fora),
+                      cache_dir=tmp_path)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert any("diverg" in a.lower() for a in score.avisos)
+
+
+# ── P6 (v3): timestamp da notícia mais recente no ScoreEcon ────────────────────
+
+
+def test_data_noticia_preenchida_com_evento(tmp_path):
+    n1 = _noticia()  # publicado_em = 2024-03-10 09:00
+    n2 = _noticia()
+    object.__setattr__(n2, "publicado_em", ts("2024-03-12 14:00"))  # mais recente
+    agent = EconAgent(journal=_journal_mock([n1, n2]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert score.data_noticia_mais_recente == ts("2024-03-12 14:00")
+
+
+def test_data_noticia_none_sem_evento(tmp_path):
+    agent = EconAgent(journal=_journal_mock([]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert score.data_noticia_mais_recente is None
+
+
+# ── v4-P6: hashes individuais das notícias usadas (auditoria) ──────────────────
+
+
+def test_noticias_hashes_preenchido_com_evento(tmp_path):
+    n1, n2 = _noticia(), _noticia(titulo="Outra notícia diferente")
+    agent = EconAgent(journal=_journal_mock([n1, n2]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert len(score.noticias_hashes) == 2
+    assert all(isinstance(h, str) and h for h in score.noticias_hashes)
+    assert len(set(score.noticias_hashes)) == 2  # notícias distintas → hashes distintos
+
+
+def test_noticias_hashes_vazio_sem_evento(tmp_path):
+    agent = EconAgent(journal=_journal_mock([]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert score.noticias_hashes == []

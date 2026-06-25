@@ -23,8 +23,13 @@ REGRA ao montar o conjunto de features do MATH&ML:
      como features OPCIONAIS — e, se incluídos, validados por cross-validation para
      confirmar que NÃO duplicam o sinal já presente nas features cruas do JOURNAL
      (risco de colinearidade que prejudica o GradientBoosting).
-  3. `score_total` (impacto da notícia) é a contribuição central do ECON — não há
-     redundância com as features cruas, pois nenhuma delas mede o efeito da notícia.
+  3. `score_total` (impacto da notícia) é a contribuição central do ECON. A Opção A
+     REDUZ a colinearidade EXPLÍCITA (não soma fundamentos/setor/macro ao total),
+     mas permanece colinearidade IMPLÍCITA: o score_total é gerado pelo Claude
+     CONDICIONADO ao contexto fundamental (que está no payload), logo incorpora essa
+     informação indiretamente. Medimos essa correlação residual na calibração
+     (`diagnosticar_colinearidade`, v4-C4) e a reportamos como diagnóstico — não
+     afirmamos colinearidade zero.
 
 TODO: implementar pipeline de features + treino walk-forward (treino 2020-2023,
 backtest OOS 2024-2025) conforme a estratégia.

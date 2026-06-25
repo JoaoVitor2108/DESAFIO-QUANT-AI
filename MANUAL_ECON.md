@@ -241,18 +241,26 @@ indisponível não derruba a avaliação** (mesma filosofia do `_coletar` do JOU
 | `justificativa` | str | Raciocínio econômico curto (rastreabilidade + auditoria, §6). |
 | `modelo` | str | Qual modelo gerou (rastreabilidade). |
 | `avisos` | list | Degradações/fontes indisponíveis / divergência score×notícia (§7). |
+| `data_noticia_mais_recente` | Timestamp\|None | Data da notícia mais recente avaliada (None sem evento). Rastreabilidade + permite ao ORQUESTRADOR decidir D+1 vs D+2 (notícia pós-17h da B3). |
+| `noticias_hashes` | list[str] | Hash individual de cada notícia que entrou no payload (auditoria — QUAIS notícias, não só quantas; vazio sem evento). |
 
 ### Por que `score_total` é só a notícia (e os componentes são contexto)
 
 Decisão **Opção A**: o `score_total` reflete **só o impacto da notícia** — o que o
 ECON tem autoridade para julgar. Saúde financeira/setor/macro são produzidos como
 **contexto** (interpretabilidade), não como parcelas somadas. Motivo prático: se o
-total fosse combinação linear dos componentes, alimentaríamos **sinal duplicado e
-colinear** ao GradientBoosting do MATH&ML — que já recebe saúde financeira, setor e
-macro como **features cruas independentes do JOURNAL**. Assim, a contribuição
-central do ECON (`score_total` = efeito da notícia) não tem redundância com as
-features cruas, e os componentes `comp_*` ficam como interpretabilidade + features
-opcionais (testadas por CV). A regra está fixada na nota de design em
+total fosse combinação linear dos componentes, alimentaríamos sinal explicitamente
+duplicado ao GradientBoosting do MATH&ML — que já recebe saúde financeira, setor e
+macro como **features cruas independentes do JOURNAL**.
+
+**Honestidade sobre colinearidade (v4-P3):** a Opção A **reduz a colinearidade
+EXPLÍCITA** (não soma componentes ao total), mas **permanece colinearidade
+IMPLÍCITA** — o `score_total` é gerado pelo Claude **condicionado ao contexto
+fundamental** (que está no payload), então incorpora essa informação indiretamente,
+mesmo sem somá-la. Não afirmamos colinearidade zero; **medimos** a correlação
+residual `corr(score_total, cada feature fundamental)` na calibração
+(`diagnosticar_colinearidade`, §9) e reportamos como diagnóstico (|corr|>0.5 =
+alerta; >0.7 = forte). A regra de consumo está fixada na nota de design em
 `agents/math_ml.py`. A desagregação ainda dá **interpretabilidade** para a banca:
 abrir um trade e ver "entrou por notícia positiva apesar de macro contrário".
 
@@ -309,25 +317,31 @@ dificuldade com notícias antigas — é que ele tem facilidade demais, com cola
 Para notícias **posteriores ao corte de conhecimento** do modelo, não há
 vazamento: ele raciocina genuinamente do zero a partir do texto fornecido.
 
-**As duas datas que governam isso (doc oficial Anthropic, `claude-haiku-4-5-20251001`):**
-- **Reliable knowledge cutoff: FEV/2025** — até aqui o modelo conhece os fatos de
-  forma confiável.
-- **Training data cutoff: JUL/2025** — o treino inclui dados (menos confiáveis)
-  entre fev e jul/2025.
-- **Fronteira da validação LIMPA = o TRAINING cutoff (jul/2025)**, não o reliable:
-  só notícia publicada **após jul/2025** está genuinamente fora do conhecimento do
-  modelo. Como o backtest OOS é 2024-2025, **apenas jul-dez/2025** é a janela do
-  backtest sem risco de lookahead de memória do LLM.
+**As duas datas (doc oficial Anthropic, `claude-haiku-4-5-20251001`) — e qual importa:**
+- **Reliable knowledge cutoff: FEV/2025** — mede a QUALIDADE do conhecimento.
+- **Training data cutoff: JUL/2025** — até aqui os dados ESTAVAM no treino.
+- **Precisão (v4-P1):** a Anthropic publica só o MÊS ("Feb 2025"/"Jul 2025"),
+  não o dia; usamos o fim do mês como fronteira CONSERVADORA (não inventamos dia).
+- **Para LOOKAHEAD só o TRAINING cutoff importa:** tudo ≤ jul/2025 esteve no treino e
+  tem o mesmo risco de cola. O período fev–jul/2025 **não** é uma zona de risco
+  "intermediário" — é risco alto igual ao de 2020-2021 (correção da v3; antes
+  havia um terceiro segmento "intermediário" que dava falsa sensação de IC parcial-
+  mente limpo). Como o backtest OOS é 2024-2025, **apenas jul-dez/2025** é a janela
+  sem risco de lookahead de memória do LLM.
 
 **Mitigações — duas defesas ativas + uma auditoria (no `calibration/econ_calibration.py`):**
-- **DEFESA 1 — IC segmentado:** a calibração reporta o IC **separado por exposição
-  ao treino**: 2020-2021 rotulado "TETO OTIMISTA (dentro do treino)"; jul-dez/2025
-  "IC LIMPO (pós-training cutoff)". Helper `segmentar_por_exposicao`.
-- **DEFESA 2 — Teste de placebo:** rerodamos o ECON nas mesmas notícias com a
-  empresa **anonimizada** (ou trocada por par do setor) e reportamos
-  **ΔIC = IC_real − IC_placebo**. Se o IC desaba ao anonimizar, parte do sinal era
-  memória do modelo sobre aquela empresa — red flag. (Os hooks `noticias_override`
-  e `nome_override` do `avaliar` existem para isso.)
+- **DEFESA 1 — IC segmentado (2 segmentos):** `segmentar_por_exposicao` classifica
+  cada evento em **"dentro_treino" (≤ jul/2025 → teto otimista)** ou **"limpo"
+  (> jul/2025)**. O `calibrar()` reporta o IC separado por segmento.
+- **DEFESA 2 — Teste de placebo (oculta a IDENTIDADE, não só o nome):** o placebo
+  antigo trocava só o nome mas mantinha fundamentos/setor/macro reais — a identidade
+  vazava (setor + dívida/EBITDA + P/L identificam a empresa). Corrigido na v3 com
+  dois modos: **"swap"** (troca A por um par B do setor — TODO o contexto vira de B,
+  avaliando o ticker de B; só o texto factual da notícia é mantido com nome A→B) e
+  **"identidade_pura"** (anonimiza o nome E oculta fundamentos/setor/macro). Reporta
+  **ΔIC = IC_real − IC_placebo**; ΔIC grande = parte do sinal era memória sobre a
+  empresa. (Hooks de `avaliar`: `noticias_override`, `nome_override`,
+  `incluir_contexto_fundamental=False`.)
 - **AUDITORIA (P8):** `auditar_justificativa` varre cada justificativa por
   linguagem **ex-post** ("caiu X% depois", "posteriormente", "veio a se confirmar",
   "em retrospecto"…). Justificativa flagueada = inspeção manual. Monitoramos o
@@ -347,7 +361,7 @@ e mitigação de vieses" (15% da nota).
 > Haiku 4.5 tem reliable cutoff em fev/2025 e training cutoff em jul/2025, então só
 > notícia pós-jul/2025 está fora do conhecimento dele. Reportamos o IC segmentado
 > por exposição ao treino (2020-2021 como teto otimista, jul-dez/2025 como IC
-> limpo), rodamos um teste de placebo anonimizando a empresa para medir quanto do
+> limpo), rodamos um teste de placebo ocultando a identidade da empresa (swap por par do setor) para medir quanto do
 > sinal vinha de memória, e auditamos as justificativas por linguagem ex-post.
 > Instrução de prompt sozinha não basta — mitigamos ativamente."
 
@@ -460,10 +474,41 @@ a execução ao vivo depende de `ANTHROPIC_API_KEY` + uma amostra de eventos.
 1. Eventos com notícia `[(ticker, data_limite), …]`. Para cada um, `score_total`
    do ECON vs. **retorno em excesso de 5 pregões** (preço da ação − Ibovespa,
    ambos do JOURNAL).
-2. **IC = Spearman(score, excesso)** (`calcular_ic`, via pandas — sem nova
-   dependência). **Meta > 0.15.**
+2. **IC = Spearman(score, excesso)** (`calcular_ic`), reportado com **intervalo de
+   confiança 95% e p-valor via bootstrap** (`calcular_ic_com_ic`, v4-C2 — um IC de
+   0.15 com N=40 pode não ser distinguível de zero). **Meta > 0.15.**
 3. Loop de ajuste de prompt ≤ 10 iterações; depois **congela** (bump de
    `_PROMPT_VERSION` a cada iteração, ver §8).
+
+### Alvo: excesso simples (primário) + ajustado por beta (secundário) — v4-P4
+
+O alvo PADRÃO é o excesso **simples** (`r_ação − r_ibov`), que valida o ECON como
+sinal **puro**, desacoplado do modelo de beta setorial (responsabilidade do
+MATH&ML). Mas o MATH&ML otimiza o excesso **ajustado por beta**; para alinhamento,
+`_retorno_excesso_5d(..., ajuste_beta=True)` também reporta o IC contra
+`r_ação − β·r_ibov`, com **β estimado na janela ANTES da data_limite**
+(`_beta_setorial`, sem lookahead). `calibrar` reporta os dois.
+
+### Baseline trivial — o LLM bate um sentimento lexical? (v4-C3)
+
+`baseline_sentimento_simples` conta palavras positivas/negativas (listas mínimas
+BR-PT). `calibrar` reporta **GAP = IC_ECON − IC_baseline**: o valor agregado do
+raciocínio do LLM **sobre** mera análise de tom. Se o LLM (caro) não bate o
+baseline (grátis), o custo do ECON não se justifica.
+
+### Taxa de degradação acompanha o IC (v4-P5)
+
+`calibrar` classifica cada avaliação (`classificar_degradacao`: sem_chave / erro_api
+/ malformada) e reporta `taxa = degradadas / avaliações` em `degradation_report.json`.
+Regra: **taxa > 5% → IC com ressalva; > 15% → calibração inválida** (degradação é
+graciosa, então sem isso uma calibração com 15% de avaliações perdidas passaria
+despercebida). (Limiares 5%/15% são regras de bolso — a revisar.)
+
+### N da janela limpa antes de rodar (v4-C1)
+
+`contar_eventos_por_segmento` reporta N por segmento ANTES do IC e **alerta se
+N_limpo < 30** (`event_count.json`) — a banca vai perguntar "quantos eventos?", e um
+Spearman sobre poucos pontos é ruído. (Limiar 30 a revisar.)
 
 ### Por que Spearman e não Pearson
 
@@ -472,26 +517,47 @@ magnitude linear do retorno. IC (Information Coefficient) por Spearman é o padr
 de quant research: 0 = aleatório, >0.05 já é útil em painel grande, >0.10–0.15 é um
 sinal respeitável para texto.
 
-### DEFESA 1 — IC segmentado por exposição ao treino
+### DEFESA 1 — IC segmentado por exposição ao treino (2 segmentos)
 
 `calibrar()` não reporta um IC único: usa `segmentar_por_exposicao(data)` para
-quebrar o resultado em **TETO OTIMISTA (≤ fev/2025, dentro do treino)**,
-**INTERMEDIÁRIO (fev–jul/2025)** e **IC LIMPO (> jul/2025, fora do training
-cutoff)**. Só o último é evidência limpa de generalização (ver §6).
+quebrar o resultado em **"dentro_treino" (≤ jul/2025 → teto otimista)** e
+**"limpo" (> jul/2025)**. Só o segundo é evidência limpa de generalização. A
+fronteira é o **training cutoff** (não o reliable): tudo ≤ jul/2025 esteve no
+treino e tem o mesmo risco de cola (ver §6).
 
-### DEFESA 2 — Teste de placebo
+### DEFESA 2 — Teste de placebo (oculta a identidade da empresa)
 
-`teste_placebo()` reroda o ECON nas mesmas notícias com a empresa **anonimizada**
-(`anonimizar_noticias` + os hooks `noticias_override`/`nome_override` do `avaliar`)
-e reporta **ΔIC = IC_real − IC_placebo**. ΔIC pequeno = o sinal vem do mecanismo
-(bom); ΔIC grande = parte do sinal era memória do modelo sobre a empresa (red
-flag). Suporta também o modo "swap" (trocar por um par do setor).
+`teste_placebo(..., estrategia=...)` reroda o ECON ocultando a identidade — não só
+o nome (o placebo "só nome" vazava a empresa pelos fundamentos). Nomenclatura
+(v4-P2): `estrategia` é o parâmetro de **alto nível** do teste; `anonimizar_noticias(...,
+modo=...)` é o helper de **baixo nível** que só mexe no texto. Duas estratégias:
+- **"swap"** (default): troca A por um par B do mesmo setor (`_par_do_setor`); todo
+  o contexto vira de B (avalia o ticker de B), só o texto da notícia é preservado
+  com o nome trocado A→B. (= `anonimizar_noticias(modo="swap")`.)
+- **"identidade_pura"**: anonimiza o nome E oculta fundamentos/setor/macro. (=
+  `anonimizar_noticias(modo="anonimizar")` + `incluir_contexto_fundamental=False`.)
+Reporta **ΔIC = IC_real − IC_placebo**; ΔIC grande = parte do sinal era memória do
+modelo sobre a empresa (red flag).
 
 ### Auditoria das justificativas (P8)
 
 `calibrar()` agrega, por evento, os flags de `auditar_justificativa` — linguagem
 ex-post que delataria vazamento de memória. O relatório conta quantas
 justificativas foram flagueadas para inspeção manual.
+
+### Escolha do modelo defendida empiricamente (v4-C5) e critério de parada (v4-C6)
+
+`comparar_modelos` roda os MESMOS eventos (subset da janela LIMPA) no MESMO prompt
+em **Haiku 4.5 vs. Sonnet 4.6**, reportando IC (com IC95) e concordância (% de
+scores com |Δ|<0.2). Critério: ganho de IC limpo do Sonnet **> 0.05 → adotar Sonnet**
+apesar do custo; **< 0.03 → ficar com Haiku**; faixa intermediária → decisão humana.
+Assim a escolha do Haiku é defendida por dado, não só por custo.
+
+**Critério de parada do loop de prompt (v4-C6):** (A) sucesso = IC limpo > 0.15 com
+IC95 não cruzando zero; (B) overfit (parar já) = IC `dentro_treino` sobe mas IC
+`limpo` não sobe entre iterações (o prompt está colando na memória); hard limit = 10
+iterações. Cada iteração faz bump de `_PROMPT_VERSION` (invalida cache) e é registrada
+em `prompt_iterations.jsonl` (`registrar_iteracao_prompt`).
 
 ### Como defender na banca
 
@@ -509,7 +575,7 @@ justificativas foram flagueadas para inspeção manual.
 cutoff em fev/2025 e training cutoff em jul/2025, então pode ter memória do
 desfecho de notícias até jul/2025 — o que inflaria o IC de calibração de 2020-2021.
 Não só documentamos: mitigamos ativamente — IC segmentado por exposição ao treino,
-teste de placebo (ΔIC ao anonimizar a empresa) e auditoria das justificativas por
+teste de placebo (ΔIC ao trocar a empresa por um par do setor) e auditoria das justificativas por
 linguagem ex-post. A validação limpa usa a fronteira do training cutoff (notícia
 após jul/2025)." (Detalhe na §6 e §9.)
 
@@ -586,7 +652,7 @@ training data cutoff em **jul/2025** (doc Anthropic). Logo, para eventos até
 jul/2025 — incluindo a calibração 2020-2021 — há risco de memória do desfecho.
 Somos transparentes e mitigamos ativamente: IC **segmentado** por exposição ao
 treino (2020-2021 = teto otimista; pós-jul/2025 = IC limpo), **teste de placebo**
-(ΔIC ao anonimizar a empresa) e **auditoria** das justificativas por linguagem
+(ΔIC ao trocar a empresa por um par do setor) e **auditoria** das justificativas por linguagem
 ex-post. A fronteira da validação limpa é o training cutoff (jul/2025), não o
 reliable.
 
@@ -595,10 +661,11 @@ R: Claude Haiku 4.5 (`claude-haiku-4-5-20251001`), temperatura zero, cutoffs
 reliable fev/2025 e training jul/2025. Haiku porque o volume de avaliações no
 backtest é alto e o custo/latência importam; a tarefa é julgamento estruturado bem
 especificado, em que o Haiku entrega bom custo-benefício. O modelo é parametrizável
-— trocar é uma linha. **TODO de calibração:** rodar um subconjunto também com
-**Claude Sonnet 4.6** e comparar IC — modelos menores às vezes captam o TOM em vez
-do MECANISMO (o erro que a regra fundadora proíbe). Se Haiku empata com Sonnet,
-defendemos o custo; se Sonnet for muito superior, reavaliamos o trade-off.
+— trocar é uma linha. A escolha é defendida **empiricamente** (`comparar_modelos`,
+v4-C5): rodamos um subconjunto da janela limpa em **Haiku 4.5 vs. Sonnet 4.6** e
+comparamos IC (com IC95) — modelos menores às vezes captam o TOM em vez do
+MECANISMO. Ganho do Sonnet >0.05 → adotar Sonnet; <0.03 → ficar com Haiku;
+intermediário → decisão humana.
 
 **P: Como controlam o custo de chamar um LLM milhares de vezes?**
 R: Design event-driven (sem notícia, sem chamada), cache em disco versionado por
