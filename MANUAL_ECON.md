@@ -338,7 +338,7 @@ vazamento: ele raciocina genuinamente do zero a partir do texto fornecido.
   vazava (setor + dívida/EBITDA + P/L identificam a empresa). Corrigido na v3 com
   dois modos: **"swap"** (troca A por um par B do setor — TODO o contexto vira de B,
   avaliando o ticker de B; só o texto factual da notícia é mantido com nome A→B) e
-  **"identidade_pura"** (anonimiza o nome E oculta fundamentos/setor/macro). Reporta
+  **"identidade_pura"** (anonimiza o nome, remove o ticker e oculta fundamentos/setor/macro). Reporta
   **ΔIC = IC_real − IC_placebo**; ΔIC grande = parte do sinal era memória sobre a
   empresa. (Hooks de `avaliar`: `noticias_override`, `nome_override`,
   `incluir_contexto_fundamental=False`.)
@@ -534,7 +534,7 @@ modo=...)` é o helper de **baixo nível** que só mexe no texto. Duas estratég
 - **"swap"** (default): troca A por um par B do mesmo setor (`_par_do_setor`); todo
   o contexto vira de B (avalia o ticker de B), só o texto da notícia é preservado
   com o nome trocado A→B. (= `anonimizar_noticias(modo="swap")`.)
-- **"identidade_pura"**: anonimiza o nome E oculta fundamentos/setor/macro. (=
+- **"identidade_pura"**: anonimiza o nome, remove o ticker e oculta fundamentos/setor/macro. (=
   `anonimizar_noticias(modo="anonimizar")` + `incluir_contexto_fundamental=False`.)
 Reporta **ΔIC = IC_real − IC_placebo**; ΔIC grande = parte do sinal era memória do
 modelo sobre a empresa (red flag).

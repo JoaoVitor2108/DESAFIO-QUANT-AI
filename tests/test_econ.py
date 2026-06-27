@@ -311,6 +311,19 @@ def test_sem_contexto_fundamental_omite_fundamentos(tmp_path):
     journal.get_retornos_setor.assert_not_called()
 
 
+def test_identidade_pura_omite_ticker(tmp_path):
+    # identidade_pura deve esconder a IDENTIDADE: o símbolo do ticker (PETR4.SA)
+    # entregaria a empresa que o placebo quer ocultar.
+    agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+    contexto = agent._montar_contexto(
+        "PETR4.SA", ts("2024-03-15 17:00"),
+        [_noticia(titulo="Empresa anuncia plano")], [],
+        nome_override="a companhia", incluir_contexto_fundamental=False)
+    assert "PETR4" not in contexto
+    assert '"ticker"' not in contexto
+
+
 def test_com_contexto_fundamental_inclui_fundamentos(tmp_path):
     agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(_TOOL_OK),
                       cache_dir=tmp_path)

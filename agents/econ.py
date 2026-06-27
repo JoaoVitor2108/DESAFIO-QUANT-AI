@@ -370,7 +370,9 @@ class EconAgent:
         }
 
         if not incluir_contexto_fundamental:
-            # identidade_pura: sem fundamentos/setor/macro — esconde a empresa.
+            # identidade_pura: além de omitir fundamentos/setor/macro, REMOVE o ticker —
+            # o símbolo (ex.: PETR4.SA) entregaria a empresa que o placebo quer ocultar.
+            payload.pop("ticker", None)
             return (
                 "Avalie a ação com base apenas no texto das notícias abaixo "
                 "(todos ex-ante à data_limite). Responda chamando a ferramenta "
