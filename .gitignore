@@ -34,3 +34,12 @@ backtest/reports/*.html
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Relatórios/resumos de revisão (mantidos locais, fora do repo)
+RELATORIO_*.md
+RESUMO_*.md
+
+# Saídas transitórias de debug
+*.log
+/saida.txt
+scripts/debug_*.py
