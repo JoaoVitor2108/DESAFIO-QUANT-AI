@@ -7,12 +7,18 @@ gracefully (pytest skip). Apenas os testes de api-down e cache usam mock.
 """
 import logging
 import pickle
+import random
 import time
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from agents.sources.gdelt import GDELTSource
+from agents.sources.gdelt import (
+    GDELTSource,
+    GDELTRateLimitedError,
+    GDELTUnavailableError,
+)
 from agents.sources.noticia import Noticia
 from config import WHITELIST_FONTES
 
@@ -27,7 +33,12 @@ def ts(s: str) -> pd.Timestamp:
 
 @pytest.fixture
 def src(tmp_path):
-    return GDELTSource(cache_dir=tmp_path, whitelist=WHITELIST_FONTES)
+    # sleep_fn capado a 1s: nos testes de integração, se o GDELT real devolver 429
+    # mid-teste, o backoff (60–480s) levaria ~15min até levantar e o teste pular.
+    # O capping mantém o caminho HTTP real mas bound a espera; a TEMPORIZAÇÃO do
+    # backoff é verificada deterministicamente em TestBackoffGDELT (mock).
+    return GDELTSource(cache_dir=tmp_path, whitelist=WHITELIST_FONTES,
+                       sleep_fn=lambda s: time.sleep(min(s, 1.0)))
 
 
 def _online() -> bool:
@@ -87,7 +98,11 @@ class TestIntegracaoGDELT:
         (falhar por rate limit). O contrato de retry/parse é garantido pelos
         testes mockados determinísticos.
         """
-        noticias = src.buscar(query, di, dl)
+        try:
+            noticias = src.buscar(query, di, dl)
+        except (GDELTRateLimitedError, GDELTUnavailableError):
+            pytest.skip("GDELT degradado agora (rate limit/indisponível); "
+                        "lógica coberta pelos testes mockados")
         if not noticias:
             pytest.skip("GDELT sem resultados agora (provável rate limit); "
                         "lógica coberta pelos testes mockados")
@@ -131,21 +146,25 @@ def no_throttle(monkeypatch):
     monkeypatch.setattr("agents.sources.gdelt._ultima_chamada", 0.0)
 
 
-def test_gdelt_api_down_retorna_vazio(src, monkeypatch, no_throttle):
+def test_gdelt_api_down_levanta_unavailable(src, monkeypatch, no_throttle):
+    # 500 (≠503) → indisponibilidade real → GDELTUnavailableError (não [] silencioso)
     class _Resp:
         status_code = 500
         text = ""
         def json(self): return {}
     monkeypatch.setattr("agents.sources.gdelt.requests.get", lambda *a, **k: _Resp())
-    noticias = src.buscar("Petrobras", ts("2024-01-01"), ts("2024-01-31 23:59"))
-    assert noticias == []
+    with pytest.raises(GDELTUnavailableError):
+        src.buscar("Petrobras", ts("2024-01-01"), ts("2024-01-31 23:59"))
 
 
-def test_gdelt_excecao_rede_retorna_vazio(src, monkeypatch, no_throttle):
+def test_gdelt_excecao_rede_levanta_unavailable(src, monkeypatch, no_throttle):
+    # ConnectionError persistente → GDELTUnavailableError após esgotar tentativas
+    import requests
     def _boom(*a, **k):
-        raise ConnectionError("rede caiu")
+        raise requests.ConnectionError("rede caiu")
     monkeypatch.setattr("agents.sources.gdelt.requests.get", _boom)
-    assert src.buscar("Vale", ts("2024-01-01"), ts("2024-01-31 23:59")) == []
+    with pytest.raises(GDELTUnavailableError):
+        src.buscar("Vale", ts("2024-01-01"), ts("2024-01-31 23:59"))
 
 
 def test_gdelt_retry_apos_429(src, monkeypatch, no_throttle):
@@ -172,14 +191,15 @@ def test_gdelt_retry_apos_429(src, monkeypatch, no_throttle):
     assert noticias[0].fonte == "reuters.com"
 
 
-def test_gdelt_rate_limit_persistente_retorna_vazio(src, monkeypatch, no_throttle):
-    # Sempre 429 → esgota tentativas → [] sem cachear.
+def test_gdelt_rate_limit_persistente_levanta(src, monkeypatch, no_throttle):
+    # Sempre 429 → esgota tentativas → GDELTRateLimitedError, sem cachear.
     class _Resp:
         status_code = 429
         text = "Please limit requests"
         def json(self): return {}
     monkeypatch.setattr("agents.sources.gdelt.requests.get", lambda *a, **k: _Resp())
-    assert src.buscar("Vale", ts("2024-01-01"), ts("2024-01-31 23:59")) == []
+    with pytest.raises(GDELTRateLimitedError):
+        src.buscar("Vale", ts("2024-01-01"), ts("2024-01-31 23:59"))
     # Não deve ter cacheado a falha
     assert not list(src.cache_dir.glob("gdelt_*.pkl")), "Falha de rate limit não pode ser cacheada"
 
@@ -210,3 +230,69 @@ def test_gdelt_cache_funciona(src, monkeypatch, no_throttle):
     assert cache_files, "Arquivo de cache GDELT não foi criado"
     with open(cache_files[0], "rb") as f:
         assert isinstance(pickle.load(f), list)
+
+
+# ── Backoff exponencial em 429/503 (mock, sem rede, sem sleep real) ────────────
+
+
+def _resp(status, json_data=None, text=""):
+    """Resposta HTTP falsa. json_data=None → resp.json() levanta ValueError."""
+    m = MagicMock()
+    m.status_code = status
+    m.text = text
+    if json_data is None:
+        m.json.side_effect = ValueError("sem json")
+    else:
+        m.json.return_value = json_data
+    return m
+
+
+_ARTIGO_OK = {"articles": [{
+    "title": "Petrobras sobe", "url": "https://reuters.com/x",
+    "domain": "reuters.com", "seendate": "20240110T120000Z",
+}]}
+
+
+class TestBackoffGDELT:
+    """Backoff em 429/503: sem rede (mock de requests.get), sem sleep real
+    (sleep_fn injetado registra esperas), determinístico (rng semeado)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_throttle(self):
+        import agents.sources.gdelt as g
+        g._ultima_chamada = 0.0   # 1ª chamada não dorme no throttle
+
+    def _src(self, tmp_path, esperas):
+        return GDELTSource(cache_dir=tmp_path, whitelist={"reuters.com": 0.9},
+                           sleep_fn=lambda s: esperas.append(s),
+                           rng=random.Random(0))
+
+    def test_429_uma_vez_depois_200_sucesso(self, tmp_path):
+        esperas = []
+        src = self._src(tmp_path, esperas)
+        with patch("agents.sources.gdelt.requests.get",
+                   side_effect=[_resp(429, text="Please limit requests"),
+                                _resp(200, _ARTIGO_OK)]):
+            resultado = src.buscar("Petrobras", ts("2024-01-01"), ts("2024-01-31 23:59"))
+        assert len(resultado) == 1        # parseou OK após o retry
+        assert len(esperas) == 1          # 1 backoff antes do retry
+        assert 50 < esperas[0] < 75       # 60s ± jitter
+
+    def test_429_persistente_levanta_RateLimitedError(self, tmp_path):
+        esperas = []
+        src = self._src(tmp_path, esperas)
+        with patch("agents.sources.gdelt.requests.get",
+                   return_value=_resp(429, text="Please limit requests")):
+            with pytest.raises(GDELTRateLimitedError):
+                src.buscar("Vale", ts("2024-01-01"), ts("2024-01-31 23:59"))
+        assert len(esperas) == 4              # esperas entre as 5 tentativas
+        assert 800 < sum(esperas) < 1100      # ~60+120+240+480 ± jitter
+
+    def test_503_tratado_como_429(self, tmp_path):
+        esperas = []
+        src = self._src(tmp_path, esperas)
+        with patch("agents.sources.gdelt.requests.get",
+                   side_effect=[_resp(503), _resp(200, {"articles": []})]):
+            resultado = src.buscar("Petrobras", ts("2024-01-01"), ts("2024-01-31 23:59"))
+        assert resultado == []   # 200 com articles vazio → lista vazia legítima
+        assert len(esperas) == 1

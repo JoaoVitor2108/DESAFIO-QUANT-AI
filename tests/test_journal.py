@@ -380,6 +380,9 @@ class TestHealthCheck:
     def test_status_sao_validos(self):
         status = _AGENT.health_check()
         for fonte, st in status.items():
+            if fonte.endswith("_count"):       # contadores numéricos (ex: gdelt_degradado_count)
+                assert isinstance(st, int) and st >= 0
+                continue
             assert st in self._VALIDOS, f"Status inválido para {fonte}: {st!r}"
 
     def test_bloomberg_vazio_sem_csv(self):

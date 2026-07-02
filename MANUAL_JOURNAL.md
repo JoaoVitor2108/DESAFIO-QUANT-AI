@@ -234,6 +234,17 @@ central: **não entrega o corpo do artigo** — só título, URL, domínio e
 `seendate`. Por isso é a camada de *volume histórico*, não de profundidade.
 O `seendate` (formato `YYYYMMDDTHHMMSSZ`, UTC) é convertido para SP.
 
+> **Rate limit do GDELT (lição aprendida).** O GDELT impõe rate limit por IP
+> não-documentado, disparado por rajadas (rodar `pytest` várias vezes seguidas já
+> ativa). O `GDELTSource` trata 429/503 com **backoff exponencial** (60s → 600s, 5
+> tentativas, ~15min no pior caso) e **levanta `GDELTRateLimitedError`** em vez de
+> degradar silenciosamente (antes devolvia `[]`, escondendo "não consegui consultar"
+> como "não houve notícia"). Erros não-rate-limit (timeout/5xx/JSON) levantam
+> `GDELTUnavailableError`. O `JournalAgent` captura as duas, loga warning e
+> incrementa `gdelt_degradado_count` (exposto em `health_check`). O throttle base é
+> configurável por `GDELT_THROTTLE_SECONDS` (default 5s; use 12–15s em backtest).
+> Cache pickle (TTL 24h) nunca é invalidado por erro. Runbook: `docs/RUNBOOK_GDELT.md`.
+
 **NewsAPI (`newsapi.py`).** Endpoint `newsapi.org/v2/everything`, requer
 `NEWS_API_KEY`. Plano gratuito cobre **apenas os últimos 30 dias** — a fonte
 clampa `data_inicio` a essa janela automaticamente (com aviso em log) e

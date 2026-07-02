@@ -37,7 +37,11 @@ from config import (
     tickers_ativos,
 )
 from agents.sources.cvm import CVMSource
-from agents.sources.gdelt import GDELTSource
+from agents.sources.gdelt import (
+    GDELTSource,
+    GDELTRateLimitedError,
+    GDELTUnavailableError,
+)
 from agents.sources.newsapi import NewsAPISource
 from agents.sources.noticia import Noticia
 
@@ -213,10 +217,13 @@ class JournalAgent:
         # Fontes de notícia especializadas (mesmo padrão modular do CVMSource)
         self.gdelt = GDELTSource(cache_dir, WHITELIST_FONTES)
         self.newsapi = NewsAPISource(cache_dir, WHITELIST_FONTES, self._news_api_key)
+        # Contador de degradação do GDELT na sessão (rate limit / indisponível),
+        # exposto no health_check para o operador conferir após um backtest.
+        self._gdelt_degradado_count = 0
 
     # ── 0. Health check ───────────────────────────────────────────────────────
 
-    def health_check(self, timeout: int = 8) -> dict[str, str]:
+    def health_check(self, timeout: int = 8) -> dict[str, str | int]:
         """Status de cada fonte de dados, para diagnóstico antes de um backtest.
 
         Retorna dict {fonte: status} com status em:
@@ -247,6 +254,8 @@ class JournalAgent:
             ),
             "cvm": self._ping(_HC_CVM, timeout=timeout, stream=True),
             "bcb": self._ping(_HC_BCB, timeout=timeout),
+            # Contador de degradação do GDELT na sessão (0 = run limpo).
+            "gdelt_degradado_count": self._gdelt_degradado_count,
         }
         logger.info("health_check: %s", status)
         return status
@@ -320,6 +329,11 @@ class JournalAgent:
                 for n in fn():
                     if n.publicado_em <= data_limite:   # filtro anti-lookahead
                         todas.append(n)
+            except (GDELTRateLimitedError, GDELTUnavailableError) as e:
+                # Degradação REAL do GDELT (não 'sem notícia'): registra e segue.
+                logger.warning("GDELT degradado (%s): %s. Seguindo com outras camadas.",
+                               type(e).__name__, e)
+                self._gdelt_degradado_count += 1
             except Exception as e:
                 logger.warning("Fonte de notícia %s falhou: %s", nome_fonte, e)
 
