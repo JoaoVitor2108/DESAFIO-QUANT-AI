@@ -688,6 +688,37 @@ def test_mock_fastpath_calibracao_consistente():
     assert mock.ic_realizado == pytest.approx(ic_injetado, abs=0.01)
 
 
+# ── 28. _prefetch tolera ticker sem dados (delisted/404), sem abortar o run ────
+
+
+def test_prefetch_tolera_ticker_sem_dados():
+    """Um ticker cujo get_precos falha (ex.: ELET3/JBSS3 404 no yfinance) deve ser
+    PULADO no _prefetch — não pode abortar o run inteiro. O caminho por-linha já
+    tolera; o _prefetch precisa tolerar igual. `construir_dataset` exclui o ticker
+    do painel (sem tempestade de retries por-linha)."""
+    from agents.journal import DadoIndisponivel
+    jr, idx, tickers = _journal_random(["AAAA", "BBBB", "CCCC"], n_dias=320)
+
+    class JornalComTickerQuebrado(FakeJournal):
+        def get_precos(self, ticker, *a, **k):
+            if ticker == "BBBB":
+                raise DadoIndisponivel("yfinance não retornou dados para 'BBBB'")
+            return super().get_precos(ticker, *a, **k)
+
+    jr2 = JornalComTickerQuebrado(jr._precos, jr._ibov, fundamentals=jr._fund)
+    agent = MathMLAgent(
+        journal=jr2,
+        econ_mock=make_econ_mock(jr2, ic_alvo=0.0, universo=["AAAA", "CCCC"]))
+
+    cache = agent._prefetch(["AAAA", "BBBB", "CCCC"], idx[256], idx[-1])
+    assert "AAAA" in cache.precos and "CCCC" in cache.precos
+    assert "BBBB" not in cache.precos          # ticker quebrado foi pulado
+
+    ds = agent.construir_dataset(["AAAA", "BBBB", "CCCC"], idx[256], idx[-1])
+    assert len(ds) > 0
+    assert "BBBB" not in set(ds["ticker"].unique())   # excluído do painel
+
+
 # ── 27. GAP_evento é NaN quando não há eventos p/ baseline (3 ≤ n ≤ 30) ────────
 
 

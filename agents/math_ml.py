@@ -447,7 +447,16 @@ class MathMLAgent:
         # get_macro(t) já devolve a SÉRIE completa warmup→t; uma chamada basta.
         cache.macro = self.journal.get_macro(fetch_fim)
         for ticker in tickers:
-            cache.precos[ticker] = self.journal.get_precos(ticker, fetch_inicio, fetch_fim)
+            # Tolera ticker sem dados (delisted / 404 no yfinance): pula em vez de
+            # abortar o run — espelha o try/except do caminho por-linha em
+            # construir_dataset. Ticker ausente do cache é filtrado na Fase 2.
+            try:
+                precos = self.journal.get_precos(ticker, fetch_inicio, fetch_fim)
+            except Exception as e:
+                logger.warning("_prefetch: get_precos(%s) falhou (%s) — ticker "
+                               "excluído do run", ticker, e)
+                continue
+            cache.precos[ticker] = precos
             cache.fundamentos[ticker] = self._prefetch_fundamentos(
                 ticker, fund_inicio, fetch_fim)
         return cache
@@ -689,6 +698,10 @@ class MathMLAgent:
         for t in cal:
             universo = tickers if tickers is not None else tickers_ativos(t)
             for ticker in universo:
+                # Ticker fora do cache = falhou no _prefetch (sem dados) → pula
+                # sem retry por-linha ao journal (evita tempestade de 404s).
+                if ticker not in cache.precos:
+                    continue
                 # Ordem deliberada: y PRIMEIRO; linhas com y=NaN (sem t+5) saem
                 # ANTES de _montar_features → o mock do ECON nunca é chamado para
                 # um t sem janela forward (e não monta feature de linha descartada).
