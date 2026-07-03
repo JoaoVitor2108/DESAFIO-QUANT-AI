@@ -301,8 +301,10 @@ def make_econ_mock(journal, ic_alvo: float = 0.15, seed: int = 42,
             # sem recomputar via journal (evita n+1 na calibração). Mesmos valores
             # (o y da amostra veio do mesmo `_alvo`).
             d = df.dropna(subset=["y"]).copy()
+            # ddof=0 (populacional) casa com `_z_info` no runtime (numpy .std());
+            # pandas .std() default é ddof=1 e enviesaria o z(y) da calibração.
             d["_z"] = d.groupby("data")["y"].transform(
-                lambda s: (s - s.mean()) / (s.std() + 1e-12))
+                lambda s: (s - s.mean()) / (s.std(ddof=0) + 1e-12))
             for _, row in d.iterrows():
                 cal.append((float(row["_z"]), float(row["y"]),
                             _ruido(row["ticker"], row["data"])))
@@ -976,8 +978,12 @@ def _spearman(a, b) -> float:
 
 
 def _max_baseline(baselines: dict, sufixo: str) -> float:
+    # Sem baseline p/ o sufixo → NaN (comparação inviável), NÃO 0.0: um piso 0
+    # inflaria o GAP no subset de evento com poucas amostras (3 ≤ n ≤ 30, quando
+    # ic_evento existe mas os baselines de evento não). GAP_total é imune: sempre
+    # tem B3_intercepto=0.0 na lista.
     vals = [v for k, v in baselines.items() if k.endswith(sufixo) and not np.isnan(v)]
-    return max(vals) if vals else 0.0
+    return max(vals) if vals else np.nan
 
 
 def _block_bootstrap_ic(y_pred, y_real, datas, n_boot: int = 1000, rng=None) -> dict:

@@ -60,6 +60,28 @@
   feature → fora do cache.
 - Nomes reais: `LookaheadError`, `self._econ_mock`, `FUSO` (constante).
 
+### Correções pós-revisão (bugs achados em auditoria)
+- **z(y) com ddof consistente:** o fast-path de calibração do mock (`amostra`
+  com coluna `y`) usava `pandas.Series.std()` (ddof=1) enquanto o runtime
+  (`_z_info`) usa `numpy.std()` (ddof=0). O `alpha` calibrado não reproduzia o
+  IC injetado no dataset (erro ∝ 1/|U|: ~3% p/ 18 tickers, ~22% p/ o smoke de
+  3). Corrigido para `std(ddof=0)`; teste `test_mock_fastpath_calibracao_consistente`
+  fecha o buraco (o fast-path antes não tinha teste — os testes usam amostra
+  sem `y`, que cai no slow-path já consistente).
+- **GAP_evento honesto:** `ic_evento` sai com ≥3 eventos, mas os baselines de
+  evento só com >30. No meio-termo, `_max_baseline` devolvia 0.0 e o GAP
+  superestimava o edge. Agora devolve NaN quando não há baseline do sufixo →
+  `GAP_evento=NaN` (comparação inviável); `GAP_total` é imune (sempre tem
+  B3_intercepto=0.0).
+
+### Débito conhecido (latente, hoje inócuo)
+- **Re-corte de IPCA no cache path:** `_macro_em_t` corta as séries do cache por
+  `index <= t`. Para IPCA/ipca_12m isso usa o mês de referência, não a data de
+  disponibilidade (~11d de lag) que o JOURNAL aplica — potencial lookahead. É
+  inócuo HOJE porque IPCA não é feature (macro = selic_nivel, selic_var_21d,
+  cambio_var_21d) e `_assert_no_lookahead` só roda no path sem cache. Se IPCA
+  virar feature, cortar por disponibilidade no cache path ANTES de usá-la.
+
 ---
 
 ## DÉBITOS E LIÇÕES DO GDELT

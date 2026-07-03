@@ -659,6 +659,66 @@ def test_avaliar_ic_estrutura_de_saida():
     assert np.isfinite(out["GAP_total"])
 
 
+# ── 26. Fast-path de calibração usa o MESMO z(y) do runtime (ddof consistente) ─
+
+
+def test_mock_fastpath_calibracao_consistente():
+    """Fast-path (amostra com 'y') deve calibrar o MESMO z(y) que o runtime injeta.
+
+    Regressão: `pandas.Series.std()` (ddof=1) na calibração fast-path divergia do
+    `numpy.ndarray.std()` (ddof=0) em `_z_info` (runtime) → `mock.ic_realizado`
+    não batia com o IC efetivamente injetado no dataset (erro ∝ 1/|U|, grande p/
+    universo pequeno). Universo de 3 tickers amplifica o efeito.
+    """
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(3)], n_dias=320)
+    # dataset base só para extrair a coluna 'y' (ativa o fast-path da calibração)
+    base = MathMLAgent(journal=jr,
+                       econ_mock=make_econ_mock(jr, ic_alvo=0.0, prob_evento=1.0,
+                                                universo=tickers))
+    ds_base = base.construir_dataset(tickers, idx[256], idx[-1])
+
+    mock = make_econ_mock(jr, ic_alvo=0.15, prob_evento=1.0, universo=tickers,
+                          amostra_calibracao=ds_base[["data", "ticker", "y"]])
+    agent = MathMLAgent(journal=jr, econ_mock=mock)
+    ds = agent.construir_dataset(tickers, idx[256], idx[-1])
+    evt = ds["tem_evento"].to_numpy(bool)
+    ic_injetado = spearmanr(ds.loc[evt, "score_econ"], ds.loc[evt, "y"]).statistic
+
+    # o IC reportado pela calibração tem que casar com o IC realmente injetado
+    assert mock.ic_realizado == pytest.approx(ic_injetado, abs=0.01)
+
+
+# ── 27. GAP_evento é NaN quando não há eventos p/ baseline (3 ≤ n ≤ 30) ────────
+
+
+def test_gap_evento_nan_sem_baseline_de_evento():
+    """GAP_evento deve ser NaN quando faltam eventos p/ um baseline de evento.
+
+    Regressão: `ic_evento` sai com ≥3 eventos, mas os baselines de evento só com
+    >30. No meio-termo (3–30), `GAP_evento` comparava contra baseline ausente
+    (fallback 0.0), superestimando o edge. Agora reporta NaN (comparação inviável),
+    enquanto GAP_total (que sempre tem B3_intercepto=0) segue definido.
+    """
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(8)], n_dias=320)
+    mock = make_econ_mock(jr, ic_alvo=0.15, prob_evento=1.0,
+                          amostra_calibracao=_amostra(idx[260:300], tickers),
+                          universo=tickers)
+    agent = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg())
+    ds = agent.construir_dataset(tickers, idx[256], idx[-1])
+    agent.treinar(ds, data_treino_fim=idx[-1 - agent.config.horizonte])
+
+    # força poucos eventos (5), no intervalo 3 ≤ n ≤ 30
+    poucos = ds.copy()
+    poucos["tem_evento"] = False
+    poucos.iloc[:5, poucos.columns.get_loc("tem_evento")] = True
+    assert 3 <= int(poucos["tem_evento"].sum()) <= 30
+    out = agent.avaliar_ic(poucos)
+
+    assert not np.isnan(out["IC_evento"])   # ic_evento ainda é calculado (≥3)
+    assert np.isnan(out["GAP_evento"])      # mas sem baseline de evento → indefinido
+    assert np.isfinite(out["GAP_total"])    # total intacto (B3_intercepto=0)
+
+
 # ── 22. Mock com |U|<3 → neutro+degradado ─────────────────────────────────────
 
 
