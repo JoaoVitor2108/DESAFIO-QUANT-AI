@@ -38,6 +38,8 @@ backtest/reports/*.html
 # Relatórios/resumos de revisão (mantidos locais, fora do repo)
 RELATORIO_*.md
 RESUMO_*.md
+# Exceção: relatório oficial de calibração do MATH&ML é entregável versionado
+!calibration/results/RELATORIO_CALIBRACAO_MATHML.md
 
 # Saídas transitórias de debug
 *.log
