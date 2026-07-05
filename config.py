@@ -138,7 +138,7 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
     "JBSS3.SA": {
         "setor": "alimentos_bebidas",
         "entrada": None,
-        "saida": None,
+        "saida": _ts("2025-06-06"),
         "confianca": "alta",
         "fonte": "B3 composição jan/2019",
         "cd_cvm": 20575,

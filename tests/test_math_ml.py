@@ -719,6 +719,79 @@ def test_prefetch_tolera_ticker_sem_dados():
     assert "BBBB" not in set(ds["ticker"].unique())   # excluído do painel
 
 
+# ── 29. sample_weight afeta o treino (default preservado) ─────────────────────
+
+
+def test_sample_weight_afeta_treino():
+    """sample_weight altera o fit; peso uniforme (=1) ≡ default (None)."""
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(6)], n_dias=320)
+    mock = make_econ_mock(jr, ic_alvo=0.15, prob_evento=0.3,
+                          amostra_calibracao=_amostra(idx[260:300], tickers),
+                          universo=tickers)
+    ds = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg()).construir_dataset(
+        tickers, idx[256], idx[-1])
+    fim = idx[-1 - 5]
+    X = ds[FEATURES].to_numpy()
+
+    def _treina(**kw):
+        # sample_weight_eventos=1.0 desativa o peso do config → o default (None)
+        # equivale a uniforme, que é a propriedade testada aqui.
+        ag = MathMLAgent(journal=jr, econ_mock=mock,
+                         config=_cfg(sample_weight_eventos=1.0))
+        ag.treinar(ds, data_treino_fim=fim, n_estimators_override=50, **kw)
+        return ag.model.predict(X)
+
+    p_def = _treina()
+    p_uni = _treina(sample_weight=lambda _: 1.0)
+    p_evt = _treina(sample_weight=lambda r: 5.0 if r["tem_evento"] else 1.0)
+
+    assert np.allclose(p_def, p_uni)          # peso uniforme ≡ default (config off)
+    assert not np.allclose(p_def, p_evt)      # peso de evento muda mensuravelmente
+
+
+# ── 33. Config sample_weight_eventos=5.0 (default) pesa eventos no treino ──────
+
+
+def test_config_sample_weight_default_5x_afeta_treino():
+    """O default do config (sample_weight_eventos=5.0) aplica peso 5x nas linhas
+    de evento AUTOMATICAMENTE (sem passar sample_weight) e aumenta o ganho da
+    feature-tese `score_econ`. Peso=1.0 desativa (uniforme)."""
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(6)], n_dias=320)
+    mock = make_econ_mock(jr, ic_alvo=0.30, prob_evento=0.3,   # eventos MISTOS
+                          amostra_calibracao=_amostra(idx[260:300], tickers),
+                          universo=tickers)
+    ds = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg()).construir_dataset(
+        tickers, idx[256], idx[-1])
+    fim = idx[-1 - 5]
+    X = ds[FEATURES].to_numpy()
+    idx_score = FEATURES.index("score_econ")
+
+    def _fit(peso):
+        ag = MathMLAgent(journal=jr, econ_mock=mock,
+                         config=_cfg(sample_weight_eventos=peso))
+        ag.treinar(ds, data_treino_fim=fim, n_estimators_override=50)
+        return ag.model
+
+    m5, m1 = _fit(5.0), _fit(1.0)          # 5x (default) vs desativado
+    assert not np.allclose(m5.predict(X), m1.predict(X))          # peso muda o fit
+    assert m5.feature_importances_[idx_score] > \
+        m1.feature_importances_[idx_score]  # 5x aumenta o ganho de score_econ
+
+
+# ── 30. n_estimators_override bypassa a regra de platô ────────────────────────
+
+
+def test_n_estimators_override_afeta_fit():
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(4)], n_dias=320)
+    mock = make_econ_mock(jr, ic_alvo=0.0, universo=tickers)
+    ds = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg()).construir_dataset(
+        tickers, idx[256], idx[-1])
+    agent = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg())
+    agent.treinar(ds, data_treino_fim=idx[-6], n_estimators_override=100)
+    assert len(agent.model.estimators_) == 100
+    assert agent.cv_report["n_estimators_source"] == "override=100"
+
+
 # ── 27. GAP_evento é NaN quando não há eventos p/ baseline (3 ≤ n ≤ 30) ────────
 
 
@@ -775,3 +848,39 @@ def test_mock_y_indisponivel_retorna_degradado():
     assert se.confianca == 0.0
     assert se.tem_evento is True
     assert "y_indisponivel" in se.avisos
+
+
+# ── 31/32. Regra de platô com fallback para argmax ────────────────────────────
+
+
+def _agent_simples():
+    jr, idx, tickers = _journal_random(["AAAA"], n_dias=60)
+    return MathMLAgent(journal=jr, econ_mock=make_econ_mock(jr, ic_alvo=0.0))
+
+
+def test_regra_de_platau_faz_fallback_para_argmax():
+    """n_platau ganancioso (< 30% do argmax) → escolhe argmax.
+
+    Regressão do colapso p/ n=1 observado no run oficial: com IC de CV quase-ruído,
+    σ no pico é grande → threshold cai abaixo do estágio 1 → platô 'pesca' n≈1
+    (predição constante). O fallback recupera o argmax."""
+    ic = np.full((3, 100), 0.10)   # mean 0.10 em todos os estágios...
+    ic[0, :] -= 0.30               # ...mas σ grande entre folds (ruído)
+    ic[2, :] += 0.30
+    ic[:, 49] += 0.001             # pico raso em n=50 → argmax
+    n_esc, info = _agent_simples()._escolher_n_estimators_platau(ic)
+    assert info["n_argmax"] == 50
+    assert info["n_platau"] < 15   # platô ganancioso
+    assert n_esc == 50             # fallback ativou → argmax
+    assert "argmax_fallback" in info["fonte"]
+
+
+def test_regra_de_platau_usa_platau_quando_razoavel():
+    """n_platau razoável (≥ 30% do argmax) → usa o platô (mais regularizado)."""
+    ic = np.zeros((3, 100))
+    ic[:, 20:50] = 0.148           # platô real desde n≈21
+    ic[:, 49] = [0.14, 0.15, 0.16]  # pico com σ pequeno → threshold logo abaixo
+    n_esc, info = _agent_simples()._escolher_n_estimators_platau(ic)
+    assert info["n_argmax"] == 50
+    assert 20 <= n_esc <= 50       # usou o platô, não o argmax puro nem n=1
+    assert "platau" in info["fonte"] and "fallback" not in info["fonte"]

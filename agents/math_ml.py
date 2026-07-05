@@ -112,6 +112,11 @@ class MathMLConfig:
     max_posicoes: int = 3           # consumido pelo ORQUESTRADOR, não aqui
     max_por_setor: int = 2
     beta_contra_setor: bool = False  # §3 refinamento opcional (default OFF)
+    sample_weight_eventos: float = 5.0
+    """Peso relativo das linhas com `tem_evento=True` no treino do GBM. Default 5.0
+    aumenta o ganho da feature-tese `score_econ` (quadruplicou no diagnóstico:
+    0.018→0.072) sem sacrificar IC líquido, alinhando o modelo com a hipótese
+    econômica. 1.0 desativa (peso uniforme = comportamento pré-Round 6)."""
     gb_params: dict = field(default_factory=lambda: dict(
         max_depth=3, learning_rate=0.05, subsample=0.8,
         n_estimators=500, random_state=42))
@@ -752,7 +757,17 @@ class MathMLAgent:
         return df
 
     # ---- treino + validação interna ----
-    def treinar(self, dataset, data_treino_fim=None) -> None:
+    def treinar(self, dataset, data_treino_fim=None, sample_weight=None,
+                n_estimators_override=None) -> None:
+        """Treina o GBM no subset `data <= data_treino_fim`.
+
+        Args:
+            sample_weight: None (default, uniforme) ou callable(linha)->float
+                aplicado por linha do treino. Só p/ experimentos (diagnóstico
+                de dilução do sinal de evento). Default None → bit-exato ao antes.
+            n_estimators_override: None (default, regra de platô) ou int que força
+                o n_estimators, ignorando o platô. Só p/ experimentos.
+        """
         c = self.config
         fim = data_treino_fim or c.treino_fim
         df = dataset[dataset["data"] <= fim].copy()
@@ -764,10 +779,29 @@ class MathMLAgent:
             df["data"].map({d: i for i, d in enumerate(sorted(df["data"].unique()))}).to_numpy()
         self._train_medians = df[FEATURES].median()
 
-        info = self._escolher_n_estimators(X, y, ords)
-        n_est = info["n_estimators"]
+        # sample_weight por linha: um callable explícito vence; senão o config
+        # pesa as linhas de evento (sample_weight_eventos, default 5.0).
+        if callable(sample_weight):
+            weights = df.apply(sample_weight, axis=1).to_numpy(dtype=float)
+        elif sample_weight is None:
+            peso_ev = getattr(c, "sample_weight_eventos", 1.0)
+            weights = (np.where(df["tem_evento"].to_numpy(dtype=bool), peso_ev, 1.0)
+                       if peso_ev != 1.0 else None)
+        else:
+            raise TypeError("sample_weight deve ser None ou callable, "
+                            f"recebido {type(sample_weight)}")
+
+        if n_estimators_override is not None:
+            n_est = int(n_estimators_override)
+            info = {"n_estimators": n_est, "n_platau": n_est, "n_argmax": None,
+                    "metodo": "override", "n_estimators_source": f"override={n_est}"}
+        else:
+            info = self._escolher_n_estimators(X, y, ords)
+            n_est = info["n_estimators"]
+            info["n_estimators_source"] = info.get("fonte", "platau")
         params = {**c.gb_params, "n_estimators": n_est}
-        self.model = GradientBoostingRegressor(**params).fit(X, y)
+        self.model = GradientBoostingRegressor(**params).fit(
+            X, y, sample_weight=weights)
         self.cv_report = info
         argmax = info.get("n_argmax")
         if argmax and abs(argmax - n_est) > 0.20 * max(argmax, 1):
@@ -796,21 +830,41 @@ class MathMLAgent:
             return {"n_estimators": n_max, "n_argmax": n_max, "n_platau": n_max,
                     "metodo": "sem_cv"}
         ic_mat = np.vstack(linhas_ic)
-        mean_ic = ic_mat.mean(axis=0)
-        n_argmax = int(mean_ic.argmax()) + 1
-        n_platau = self._n_estimators_platau(ic_mat)
-        return {"n_estimators": n_platau, "n_argmax": n_argmax,
-                "n_platau": n_platau, "metodo": "platau", "n_folds": len(linhas_ic)}
+        n_escolhido, plat = self._escolher_n_estimators_platau(ic_mat)
+        return {"n_estimators": n_escolhido, "n_argmax": plat["n_argmax"],
+                "n_platau": plat["n_platau"], "n_escolhido": n_escolhido,
+                "metodo": "platau", "fonte": plat["fonte"],
+                "n_folds": len(linhas_ic)}
 
     @staticmethod
-    def _n_estimators_platau(ic_mat: np.ndarray, tol: float = 0.5) -> int:
-        """Menor n cujo IC médio de validação está dentro de `tol` desvios-padrão
-        do pico — o início do platô (mais regularizado que o argmax)."""
+    def _escolher_n_estimators_platau(ic_mat: np.ndarray, tol_sigma: float = 0.5,
+                                      razao_minima: float = 0.3):
+        """Escolhe n_estimators pelo platô, com FALLBACK para o argmax.
+
+        Platô = menor n cujo IC médio de validação está dentro de `tol_sigma`
+        desvios-padrão do pico (mais regularizado que o argmax). Mas quando o IC
+        de CV é quase-ruído, σ no pico fica grande e o platô 'pesca' n≈1 (predição
+        constante, IC=NaN — o colapso observado no run oficial). Guarda: se
+        `n_platau < razao_minima × n_argmax`, o platô é ganancioso demais e caímos
+        no argmax.
+
+        Retorna: (n_escolhido, {n_platau, n_argmax, n_escolhido, fonte}).
+        """
         mean_ic = ic_mat.mean(axis=0)
+        n_argmax = int(mean_ic.argmax()) + 1
         std_at_peak = ic_mat[:, mean_ic.argmax()].std()
-        threshold = mean_ic.max() - tol * std_at_peak
+        threshold = mean_ic.max() - tol_sigma * std_at_peak
         candidatos = np.where(mean_ic >= threshold)[0]
-        return int(candidatos[0]) + 1
+        n_platau = int(candidatos[0]) + 1 if len(candidatos) else n_argmax
+        if n_platau < razao_minima * n_argmax:
+            n_escolhido = n_argmax
+            fonte = (f"argmax_fallback (n_platau={n_platau} < "
+                     f"{razao_minima:.0%} de n_argmax={n_argmax})")
+        else:
+            n_escolhido = n_platau
+            fonte = f"platau (n_platau={n_platau}, n_argmax={n_argmax})"
+        return n_escolhido, {"n_platau": n_platau, "n_argmax": n_argmax,
+                             "n_escolhido": n_escolhido, "fonte": fonte}
 
     def avaliar_ic(self, dataset, mascara=None, n_boot: int = 1000) -> dict:
         if self.model is None:
