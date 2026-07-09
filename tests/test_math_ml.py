@@ -326,6 +326,93 @@ def test_prever_universo_ordena():
     assert list(out["rank"]) == list(range(1, len(out) + 1))
 
 
+def test_prever_universo_projeta_colunas_extras():
+    """Contrato do ORQUESTRADOR: além de ticker/y_pred/score_econ/tem_evento/rank,
+    a projeção expõe volume_relativo (float), data_noticia_mais_recente (tz-aware
+    America/Sao_Paulo ou NaT) e setor (str não-vazia)."""
+    import dataclasses
+
+    jr, idx, tickers = _journal_random([f"T{i}" for i in range(6)], n_dias=320)
+    base = make_econ_mock(jr, ic_alvo=0.15, prob_evento=1.0,
+                          amostra_calibracao=_amostra(idx[260:300], tickers),
+                          universo=tickers)
+    data_noticia = idx[299] + pd.Timedelta(hours=18)  # tz-aware SP, pós-17h05
+
+    class _MockComData:
+        """Envolve o mock e anexa data_noticia_mais_recente em dias de evento
+        (o mock padrão deixa o campo em None → exercita só o ramo NaT)."""
+
+        def __call__(self, ticker, data_limite):
+            se = base(ticker, data_limite)
+            if se.tem_evento:
+                return dataclasses.replace(se,
+                                           data_noticia_mais_recente=data_noticia)
+            return se
+
+        def set_cache(self, cache):
+            base.set_cache(cache)
+
+    agent = MathMLAgent(journal=jr, econ_mock=_MockComData(), config=_cfg())
+    ds = agent.construir_dataset(tickers, idx[256], idx[-1])
+    agent.treinar(ds, data_treino_fim=idx[-1 - agent.config.horizonte])
+    out = agent.prever_universo(tickers, idx[300])
+
+    esperado = {"ticker", "y_pred", "score_econ", "tem_evento", "rank",
+                "volume_relativo", "data_noticia_mais_recente", "setor"}
+    assert esperado == set(out.columns)
+
+    # volume_relativo: float
+    assert out["volume_relativo"].dtype == float
+
+    # data_noticia_mais_recente: coluna tz-aware America/Sao_Paulo (ou NaT)
+    dtype = out["data_noticia_mais_recente"].dtype
+    assert isinstance(dtype, pd.DatetimeTZDtype)
+    assert str(dtype.tz) == "America/Sao_Paulo"
+    # prob_evento=1.0 → todo dia tem evento → sem NaT e o valor propaga intacto
+    assert out["data_noticia_mais_recente"].notna().all()
+    assert (out["data_noticia_mais_recente"] == data_noticia).all()
+
+    # setor: str não-vazia (FakeJournal.get_setor → "Setor Teste")
+    assert (out["setor"] == "Setor Teste").all()
+    assert out["setor"].map(lambda s: isinstance(s, str) and len(s) > 0).all()
+
+
+def test_volume_relativo_cru_preserva_nan():
+    """volume_relativo sai CRU na projeção: ticker com <20du de histórico → NaN
+    (NÃO imputado à mediana do dia), para falhar o filtro `> 1.5` do ORQUESTRADOR
+    (NaN > 1.5 == False). Ticker com histórico completo → float finito."""
+    idx = _dias_uteis("2020-01-01", 320)
+    longos = [f"T{i}" for i in range(6)]
+    curto = "CURTO"
+    precos = {t: _frame_precos(idx, _random_walk(idx, i + 1))
+              for i, t in enumerate(longos)}
+    # CURTO: só 16 pregões (idx[290:306]) → em idx[300] tem pos < janela_volume(20)
+    idx_curto = idx[290:306]
+    precos[curto] = _frame_precos(idx_curto, _random_walk(idx_curto, 777))
+    ibov = _frame_precos(idx, _random_walk(idx, 999, start=1000.0, sigma=0.01))
+    jr = FakeJournal(precos, ibov)
+
+    universo = longos + [curto]
+    mock = make_econ_mock(jr, ic_alvo=0.15, prob_evento=1.0,
+                          amostra_calibracao=_amostra(idx[260:300], longos),
+                          universo=universo)
+    agent = MathMLAgent(journal=jr, econ_mock=mock, config=_cfg())
+    ds = agent.construir_dataset(universo, idx[256], idx[-1])
+    agent.treinar(ds, data_treino_fim=idx[-1 - agent.config.horizonte])
+    out = agent.prever_universo(universo, idx[300])
+
+    assert curto in set(out["ticker"]), "CURTO deveria sobreviver à projeção"
+    row_curto = out.loc[out["ticker"] == curto].iloc[0]
+    row_longo = out.loc[out["ticker"] == "T0"].iloc[0]
+
+    # CURTO: <20du de volume → NaN CRU, não a mediana imputada do dia
+    assert pd.isna(row_curto["volume_relativo"])
+    # LONGO: histórico completo → float finito (valor medido, não mediana)
+    assert np.isfinite(row_longo["volume_relativo"])
+    # há pelo menos um valor válido no dia (senão o NaN de CURTO seria trivial)
+    assert out["volume_relativo"].notna().any()
+
+
 # ── 11. Walk-forward não vaza ─────────────────────────────────────────────────
 
 

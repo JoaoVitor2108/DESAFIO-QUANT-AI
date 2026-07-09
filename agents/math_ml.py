@@ -645,6 +645,10 @@ class MathMLAgent:
             or getattr(fund, "pvp", None) is None,
             "econ_degradado": econ_degradado,
             "tem_evento": bool(se.tem_evento),
+            # metadado de timing p/ ORQUESTRADOR (D+1 vs D+2). Passthrough puro:
+            # NÃO é FEATURE nem FLAG — só viaja no dict até prever_universo e é
+            # ignorado por _imputar_cross_sectional/treino (que usam só FEATURES).
+            "data_noticia_mais_recente": se.data_noticia_mais_recente,
         }
 
     def _assert_no_lookahead(self, t, *, precos=None, fund=None, macro=None,
@@ -918,8 +922,34 @@ class MathMLAgent:
         return float(self.model.predict(x)[0])
 
     def prever_universo(self, tickers, data_limite) -> pd.DataFrame:
+        """Prevê o retorno idiossincrático 5du de cada ticker em `data_limite`.
+
+        Contrato de saída (consumido pelo ORQUESTRADOR) — uma linha por ticker
+        que sobreviveu à montagem de features, ordenada por `y_pred` desc:
+
+        | coluna                    | tipo                     | significado |
+        |---------------------------|--------------------------|-------------|
+        | ticker                    | str                      | ex.: "PETR4.SA" |
+        | y_pred                    | float                    | retorno idiossincrático 5du previsto |
+        | score_econ                | float ∈ [-1, +1]         | ScoreEcon.score_total (ECON real ou mock) |
+        | tem_evento                | bool                     | houve notícia relevante no dia |
+        | rank                      | int (1 = melhor)         | ranking cross-sectional por y_pred desc |
+        | volume_relativo           | float                    | Vol[t]/média(Vol[t-20:t]); valor CRU (pré-imputação): NaN se <20du de histórico — chega assim ao ORQUESTRADOR p/ falhar o filtro `> 1.5` |
+        | data_noticia_mais_recente | datetime tz-aware ou NaT | timing D+1 vs D+2; NaT se sem evento no dia |
+        | setor                     | str                      | setor via JournalAgent.get_setor(ticker) |
+
+        `data_noticia_mais_recente` é sempre tz-aware em America/Sao_Paulo (ou
+        `pd.NaT`). `setor` sai do UNIVERSO_HISTORICO; propaga `DadoIndisponivel`
+        se o ticker não estiver lá (sinaliza bug de universo, não silenciar).
+
+        Raises:
+            RuntimeError: se o modelo não foi treinado.
+            LookaheadError: se alguma fonte expôs dado posterior a `data_limite`.
+        """
         if self.model is None:
             raise RuntimeError("modelo não treinado.")
+        _COLS_OUT = ["ticker", "y_pred", "score_econ", "tem_evento", "rank",
+                     "volume_relativo", "data_noticia_mais_recente", "setor"]
         linhas = []
         for ticker in tickers:
             try:
@@ -932,17 +962,29 @@ class MathMLAgent:
             feats["ticker"] = ticker
             linhas.append(feats)
         if not linhas:
-            return pd.DataFrame(columns=["ticker", "y_pred", "score_econ",
-                                         "tem_evento", "rank"])
+            return pd.DataFrame(columns=_COLS_OUT)
         df = pd.DataFrame(linhas)
         df["data"] = data_limite  # único dia → mediana cross-sectional do universo
+        # volume_relativo CRU (pré-imputação): o contrato de saída expõe o valor
+        # medido, não o imputado. NaN (<20du de histórico) deve chegar cru ao
+        # ORQUESTRADOR p/ falhar no filtro `> 1.5` (NaN > 1.5 == False). Imputar
+        # à mediana do dia vazaria sinal transversal entre tickers no filtro.
+        volume_relativo_cru = df["volume_relativo"].copy()
         # imputação cross-sectional do dia; fallback nas medianas de treino
         df = self._imputar_cross_sectional(df, medianas_treino=self._train_medians)
-        df["y_pred"] = self.model.predict(df[FEATURES].to_numpy())
-        out = df[["ticker", "y_pred", "score_econ", "tem_evento"]].copy()
+        df["y_pred"] = self.model.predict(df[FEATURES].to_numpy())  # usa imputado
+        df["volume_relativo"] = volume_relativo_cru  # projeção usa o CRU
+        out = df[["ticker", "y_pred", "score_econ", "tem_evento",
+                  "volume_relativo", "data_noticia_mais_recente"]].copy()
         out = out.sort_values("y_pred", ascending=False).reset_index(drop=True)
         out["rank"] = np.arange(1, len(out) + 1)
-        return out
+        # setor: um get_setor por ticker sobrevivente (lookup puro em
+        # UNIVERSO_HISTORICO, sem I/O). Propaga DadoIndisponivel se faltar.
+        out["setor"] = out["ticker"].map(self.journal.get_setor)
+        # timing normalizado: tz-aware America/Sao_Paulo ou NaT (None→NaT).
+        out["data_noticia_mais_recente"] = pd.to_datetime(
+            out["data_noticia_mais_recente"], utc=True).dt.tz_convert(FUSO)
+        return out[_COLS_OUT]
 
     def _linha_para_X(self, feats: dict) -> np.ndarray:
         s = pd.Series({f: feats.get(f, np.nan) for f in FEATURES}, dtype=float)
