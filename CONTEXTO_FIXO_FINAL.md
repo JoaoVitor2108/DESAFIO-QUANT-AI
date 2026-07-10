@@ -25,10 +25,12 @@ Management.
   treinar antes da API key do ECON. **Contrato de `prever_universo`
   expandido para 8 colunas — consumido pelo ORQUESTRADOR (ver seção
   específica abaixo).**
-- ORQUESTRADOR (em implementação — 4º agente): coordena os 3 agentes
+- ORQUESTRADOR (implementado, 56 testes): coordena os 3 agentes
   anteriores, toma decisão final e aplica gestão de risco. Agente
-  central. Arquitetura fechada; regras travadas; implementação em
-  Claude Code em 7 etapas com approval gates.
+  central. Contrato público: `decidir(data, equity_hoje) → DecisaoDia`,
+  `notificar_execucao`, `notificar_fechamento`, `status`. Não chama
+  JOURNAL diretamente. Implementado via Claude Code em 7 etapas com
+  approval gate por etapa.
 - PROGRAM (não implementado): backtest com custos, Monte Carlo, e
   visualizações. Depende do ORQUESTRADOR pronto.
 
@@ -571,7 +573,10 @@ agents/
                        _DatasetCache, _prefetch, make_econ_mock,
                        regra de platô com fallback,
                        prever_universo com 8 colunas)
-- orchestrator.py     (em implementação — 7 etapas via Claude Code)
+- orchestrator.py     (implementado, 56 testes; contrato do §5 do
+                       prompt do ORQUESTRADOR + privados
+                       _atualizar_pausa, _selecionar_ordens,
+                       _resolver_data_execucao, _verificar_fechamentos)
 - program.py          (stub — depois do orchestrator)
 - sources/
   - noticia.py        (Noticia + helpers de whitelist)
@@ -593,7 +598,7 @@ tests/
 - test_journal.py, test_cvm.py, test_gdelt.py, test_newsapi.py
 - test_econ.py, test_econ_calibration.py
 - test_math_ml.py     (35 testes)
-- test_orchestrator.py (a criar — meta ≥ 25 testes)
+- test_orchestrator.py (56 testes, incluindo 3 de integração)
 scripts/
 - smoke_test_mathml.py, smoke_test_v2.py
 - debug_dataset.py
@@ -603,19 +608,21 @@ scripts/
 
 ## Decisões pendentes
 
-### ORQUESTRADOR — arquitetura fechada, implementação em andamento
-Todas as 4 ambiguidades das regras originais foram resolvidas:
-1. **Regra de entrada:** top-N dinâmico (3 − posições_abertas) com
-   filtro setorial embutido no loop. ✓
-2. **Sizing:** equal weight 15%. ✓
-3. **Stop/take:** manter −8%/+15%/5du honestos (dominância de saída
+### ORQUESTRADOR — implementação concluída
+Todas as 4 ambiguidades das regras originais foram resolvidas e
+implementadas:
+1. **Regra de entrada:** resolvida com top-N dinâmico
+   (3 − posições_abertas) e filtro setorial embutido no loop. ✓
+2. **Sizing:** resolvido com equal weight 15%. ✓
+3. **Stop/take:** mantidos −8%/+15%/5du honestos (dominância de saída
    por prazo declarada abertamente no relatório). ✓
-4. **Circuit-breaker:** trailing 21du peak-to-trough > 10% pausa
-   entradas por 5 dias úteis. ✓
+4. **Circuit-breaker:** implementado como trailing 21du peak-to-trough
+   > 10%, pausando entradas por 5 dias úteis. ✓
 
-Implementação em 7 etapas via Claude Code, com approval gate entre
-cada uma. Testes obrigatórios em cada etapa (meta ≥ 25 testes totais).
-Anti-lookahead auditado explicitamente no §10 do prompt do ORQUESTRADOR.
+Implementado em 7 etapas via Claude Code, com approval gate entre cada
+uma. 56 testes determinísticos (incluindo 3 de integração), acima da
+meta de 25. Anti-lookahead auditado explicitamente no §10 do prompt do
+ORQUESTRADOR.
 
 ### Outros pendentes
 - **PROGRAM (motor de backtest):** após ORQUESTRADOR estar pronto.
@@ -626,6 +633,21 @@ Anti-lookahead auditado explicitamente no §10 do prompt do ORQUESTRADOR.
   palavra sobre fechamento (stop/take intraday) e ignora
   `FechamentoOrdem` de prazo/reversão em caso de conflito no mesmo
   dia. Teste de integração desse contrato é TODO do PROGRAM.
+
+  **TODOs de integração PROGRAM+ORQUESTRADOR** (obrigatórios quando
+  o PROGRAM for implementado):
+  1. Teste de integração cobrindo o cenário em que stop/take
+     intraday dispara no mesmo dia em que o ORQUESTRADOR retorna
+     `FechamentoOrdem(motivo="prazo")` ou `"reversao"` para o mesmo
+     ticker. Assert que PROGRAM fecha por stop/take e ignora o
+     fechamento retornado pelo ORQUESTRADOR. Preserva a prioridade
+     `stop > take > prazo > reversão` na fronteira dos dois agentes.
+  2. Convenção de `equity_hoje`: PROGRAM deve documentar
+     explicitamente se passa equity de fechamento de t-1
+     (mark-to-market ao início do dia D) ou equity de fechamento de
+     D (após executar ordens do dia). ORQUESTRADOR aceita ambos
+     mas exige consistência ao longo do backtest — mudança de
+     convenção no meio quebra o cálculo de drawdown.
 - **Calibração real do ECON:** Haiku 4.5 vs Sonnet 4.6 empiricamente
   via `comparar_modelos` quando API key chegar. Substitui mock.
 - **Cobertura completa do IBOV 2025** (TODOs em UNIVERSO_HISTORICO).
