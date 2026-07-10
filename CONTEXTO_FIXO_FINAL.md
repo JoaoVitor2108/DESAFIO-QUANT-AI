@@ -604,6 +604,8 @@ scripts/
 - debug_dataset.py
 - diagnostico_gbm.py
 - sensibilidade_econ.py   (run oficial dos 4 modos)
+- smoke_test_orquestrador.py   (fluxo completo 10 dias com Fakes,
+                                demonstração executável do agente)
 ```
 
 ## Decisões pendentes
