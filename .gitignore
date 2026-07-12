@@ -45,3 +45,12 @@ RESUMO_*.md
 *.log
 /saida.txt
 scripts/debug_*.py
+
+# Ferramenta graphify (grafo de conhecimento local — cache regenerável +
+# config/hooks pessoais; não versionado para não forçar a ferramenta a quem clona)
+graphify-out/
+.claude/
+CLAUDE.md
+
+# Relatórios em PDF (mantidos locais, fora do repo — mesma política dos RELATORIO_*.md)
+RELATORIO_*.pdf
