@@ -498,6 +498,35 @@ def test_fechamento_forcado_no_fim_backtest():
     assert ("PETR4.SA", _sp("2024-03-07")) in orq.fechamentos_notificados
 
 
+def test_capital_final_menor_que_equity_final_quando_fim_backtest_dispara():
+    """E/R8×R1 — com posição aberta no último dia, R8 força fechamento e cobra
+    custo de saída. Consequência documentada: `capital_final = equity_diario.iloc[-1]
+    - Σ custo_saida_fim_backtest` (< equity final). Valida a tensão R8×R1 —
+    não é bug: liquidação forçada custa, o backtest não "regala" a saída."""
+    # Abre PETR4 no dia 1 (exec 03-05) e NUNCA fecha → aberto em 03-08.
+    datas = ["2024-03-04", "2024-03-05", "2024-03-06", "2024-03-07", "2024-03-08"]
+    df = _serie_df(datas, 100, 101, 99, 100,
+                   overrides={"2024-03-08": {"c": 105, "h": 106}})
+    cron = {_sp("2024-03-04"): mk_decisao(_sp("2024-03-04"),
+        novas_ordens=[mk_ordem("PETR4.SA", _sp("2024-03-05"))])}
+    engine, _, _ = _engine({"PETR4.SA": df}, cron)
+    res = engine.rodar_backtest(_d("2024-03-04"), _d("2024-03-08"))
+
+    trades_fim = res.trades[res.trades["motivo"] == "fim_backtest"]
+    assert len(trades_fim) == 1
+
+    custo_saida_fim = trades_fim["custo_saida"].sum()
+    assert custo_saida_fim > 0
+    assert custo_saida_fim == pytest.approx(0.004 * 105 * 150)  # 63.0 exato
+
+    diferenca = res.equity_diario.iloc[-1] - res.capital_final
+    assert diferenca == pytest.approx(custo_saida_fim, abs=1e-6)
+    assert res.capital_final < res.equity_diario.iloc[-1]
+    # Valores exatos (mordem mutação): equity[-1]=100690, capital_final=100627
+    assert res.equity_diario.iloc[-1] == pytest.approx(100_690.0)
+    assert res.capital_final == pytest.approx(100_627.0)
+
+
 def test_fechamento_prazo_pula_para_proximo_pregao_apos_feriado():
     """E26/R1 Passo 3 — D+1 é feriado (Sexta Santa): fechamento executa no próximo
     pregão (04-01), não em 03-29."""

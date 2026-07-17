@@ -150,6 +150,10 @@ class ResultadoBacktest:
     - `equity_diario`: Série indexada por data (naive), valor em R$, um ponto por
       dia útil (mark-to-market do fim do dia).
     - `avisos`: lista de dicts {tipo, data, ticker, detalhe}.
+
+    Nota: quando há posições abertas no último dia, `capital_final ≤
+    equity_diario.iloc[-1]` — a diferença é o custo de liquidação forçada (R8).
+    Igualdade quando não há posições abertas ao fim do backtest.
     """
 
     trades: pd.DataFrame
@@ -518,9 +522,16 @@ class BacktestEngine:
     def _forcar_fechamento_fim_backtest(
         self, data_fim: pd.Timestamp
     ) -> list[TradeRegistro]:
-        """Fecha TODAS as posições ainda abertas pelo Close[data_fim], motivo
-        'fim_backtest', em ordem alfabética de ticker (R8/R9). Custo de saída
-        aplicado normalmente; ORQUESTRADOR notificado."""
+        """Fecha todas as posições abertas ao fim do backtest usando
+        `Close[data_fim]` com `motivo='fim_backtest'`, em ordem alfabética de
+        ticker (R8/R9). Custo de saída (0.4%) é aplicado normalmente.
+
+        Consequência auditável (tensão R8×R1): quando há posições abertas no
+        último dia, `capital_final ≤ equity_diario.iloc[-1]` — a diferença é a
+        soma dos custos de saída forçada. Igualdade só quando não há posições
+        abertas ao fim. Essa política preserva honestidade metodológica:
+        liquidação forçada custa, como custaria em produção — o backtest não
+        "regala" a saída. ORQUESTRADOR notificado."""
         trades: list[TradeRegistro] = []
         for ticker in sorted(self._posicoes_internas):
             pos = self._posicoes_internas[ticker]
