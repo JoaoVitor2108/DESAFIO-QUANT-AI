@@ -18,6 +18,11 @@ from backtest.metrics import (
     atribuir_por_setor,
     calcular_metricas,
 )
+from backtest.monte_carlo import (
+    ResultadoMonteCarlo,
+    rodar_bootstrap_retornos_trades,
+    rodar_permutacao_ordem_trades,
+)
 
 __all__ = [
     "BacktestEngine",
@@ -29,4 +34,7 @@ __all__ = [
     "calcular_metricas",
     "atribuir_por_motivo",
     "atribuir_por_setor",
+    "ResultadoMonteCarlo",
+    "rodar_bootstrap_retornos_trades",
+    "rodar_permutacao_ordem_trades",
 ]
