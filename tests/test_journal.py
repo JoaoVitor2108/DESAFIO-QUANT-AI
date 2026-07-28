@@ -395,60 +395,67 @@ class TestHealthCheck:
         assert agente.health_check()["newsapi"] == "sem_chave"
 
 
-# ── Validação do CSV Bloomberg ────────────────────────────────────────────────
+# ── Integração Bloomberg CSV na cascata (Etapa 2) ─────────────────────────────
+#
+# O loader antigo (_bloomberg_csv lendo data/bloomberg/*.csv no schema legado)
+# foi substituído pela delegação a BloombergCSVSource (CSV parseado da Etapa 1,
+# schema data,ticker,...,corpo,resumo_ia). A validação de schema/leitura agora
+# vive em tests/test_bloomberg_csv.py; aqui testamos só a INTEGRAÇÃO na cascata.
+
+_PARSED_HEADER = "data,ticker,titulo,fonte,url,peso,corpo,resumo_ia\n"
 
 
-def _agent_com_bloomberg(tmp_path) -> JournalAgent:
+def _agent_bloomberg_parsed(tmp_path, linhas_csv: str) -> JournalAgent:
+    """JournalAgent com CSV Bloomberg parseado (schema Etapa 1) em bbg/parsed/."""
+    bbg = tmp_path / "bbg"
+    (bbg / "parsed").mkdir(parents=True, exist_ok=True)
+    (bbg / "parsed" / "noticias.csv").write_text(_PARSED_HEADER + linhas_csv, encoding="utf-8")
     (tmp_path / "cache").mkdir(exist_ok=True)
-    return JournalAgent(cache_dir=tmp_path / "cache", bloomberg_dir=tmp_path)
+    return JournalAgent(cache_dir=tmp_path / "cache", bloomberg_dir=bbg)
 
 
-_HEADER_OK = "ticker,data_publicacao,titulo,conteudo,url,categoria\n"
+def test_journal_agent_usa_bloomberg_csv_como_primeira_fonte(tmp_path, monkeypatch):
+    linha = (
+        "2025-10-10T14:30:00-03:00,PETR4.SA,Petrobras anuncia dividendo extra,"
+        "Bloomberg News,,1.0,Corpo curado da Bloomberg.,Resumo denso.\n"
+    )
+    agent = _agent_bloomberg_parsed(tmp_path, linha)
+    monkeypatch.setattr(agent.gdelt, "buscar", lambda *a, **k: [])
+    monkeypatch.setattr(agent.newsapi, "buscar", lambda *a, **k: [])
+
+    noticias = agent.get_noticias("PETR4.SA", ts("2025-10-12 12:00"), lookback_days=7)
+    assert len(noticias) == 1
+    n = noticias[0]
+    assert n.peso_fonte == 1.0
+    assert n.fonte == "Bloomberg News"
+    assert n.titulo == "Petrobras anuncia dividendo extra"
+    # Reconciliação de schema: resumo_ia primeiro, corpo depois.
+    assert n.conteudo == "Resumo denso.\n\nCorpo curado da Bloomberg."
 
 
-class TestBloombergCSVValidacao:
-    def test_coluna_faltando_levanta(self, tmp_path):
-        # Sem a coluna 'categoria'
-        (tmp_path / "noticias.csv").write_text(
-            "ticker,data_publicacao,titulo,conteudo,url\n"
-            "PETR4.SA,2024-05-10 09:00,Petrobras sobe,corpo,https://bloomberg.com/x\n"
-        )
-        agent = _agent_com_bloomberg(tmp_path)
-        with pytest.raises(ValueError, match="categoria"):
-            agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+def test_journal_agent_deduplica_bloomberg_vs_gdelt_privilegiando_bloomberg(tmp_path, monkeypatch):
+    titulo = "Petrobras anuncia dividendo extra aos acionistas"
+    linha = f"2025-10-10T14:30:00-03:00,PETR4.SA,{titulo},Bloomberg News,,1.0,Corpo Bloomberg.,\n"
+    agent = _agent_bloomberg_parsed(tmp_path, linha)
 
-    def test_coluna_extra_levanta(self, tmp_path):
-        (tmp_path / "noticias.csv").write_text(
-            _HEADER_OK.rstrip() + ",coluna_intrusa\n"
-            "PETR4.SA,2024-05-10 09:00,Petrobras sobe,corpo,https://bloomberg.com/x,mercado,xxx\n"
-        )
-        agent = _agent_com_bloomberg(tmp_path)
-        with pytest.raises(ValueError, match="coluna_intrusa"):
-            agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
+    # GDELT devolve a MESMA notícia (título idêntico, dentro de 24h), peso menor.
+    gdelt_noticia = Noticia(
+        titulo=titulo,
+        conteudo="Versao GDELT (deve perder na dedup).",
+        url="https://reuters.com/x",
+        publicado_em=ts("2025-10-10 15:00"),
+        fonte="reuters.com",
+        peso_fonte=0.95,
+        ticker="Petrobras",
+    )
+    monkeypatch.setattr(agent.gdelt, "buscar", lambda *a, **k: [gdelt_noticia])
+    monkeypatch.setattr(agent.newsapi, "buscar", lambda *a, **k: [])
 
-    def test_linha_com_timestamp_invalido_pula_so_ela(self, tmp_path, caplog):
-        (tmp_path / "noticias.csv").write_text(
-            _HEADER_OK +
-            "PETR4.SA,data-invalida,Petrobras linha ruim,corpo,https://bloomberg.com/a,mercado\n"
-            "PETR4.SA,2024-05-10 09:00,Petrobras linha boa,corpo,https://bloomberg.com/b,mercado\n"
-        )
-        agent = _agent_com_bloomberg(tmp_path)
-        with caplog.at_level("WARNING"):
-            result = agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
-        assert len(result) == 1, "Só a linha válida deve ser retornada"
-        assert result[0].titulo == "Petrobras linha boa"
-        assert any("linha 2" in m for m in caplog.messages), "Aviso deve citar o nº da linha"
-
-    def test_csv_valido_retorna_noticias(self, tmp_path):
-        (tmp_path / "noticias.csv").write_text(
-            _HEADER_OK +
-            "PETR4.SA,2024-05-10 09:00,Petrobras anuncia dividendo,corpo,https://bloomberg.com/x,mercado\n"
-        )
-        agent = _agent_com_bloomberg(tmp_path)
-        result = agent._bloomberg_csv("Petrobras", ts("2024-05-01"), ts("2024-05-31 23:59"))
-        assert len(result) == 1
-        assert result[0].fonte == "bloomberg_csv"
-        assert result[0].peso_fonte == 1.0
+    noticias = agent.get_noticias("PETR4.SA", ts("2025-10-12 12:00"), lookback_days=7)
+    assert len(noticias) == 1, "dedup deve colapsar Bloomberg + GDELT no mesmo item"
+    assert noticias[0].peso_fonte == 1.0
+    assert noticias[0].fonte == "Bloomberg News", "Bloomberg (1.0) deve vencer sobre GDELT (0.95)"
+    assert noticias[0].conteudo == "Corpo Bloomberg."
 
 
 # ── get_noticias: não cachear resultado vazio (anti cache-poisoning) ──────────

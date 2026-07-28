@@ -36,6 +36,7 @@ from config import (
     WHITELIST_FONTES,
     tickers_ativos,
 )
+from agents.sources.bloomberg_csv import BloombergCSVSource
 from agents.sources.cvm import CVMSource
 from agents.sources.gdelt import (
     GDELTSource,
@@ -215,6 +216,8 @@ class JournalAgent:
         self._fred_api_key = os.getenv("FRED_API_KEY", "")
 
         # Fontes de notícia especializadas (mesmo padrão modular do CVMSource)
+        # Bloomberg (primária, 1.0): CSV parseado da Etapa 1, indexado por ticker.
+        self.bloomberg = BloombergCSVSource(bloomberg_dir / "parsed" / "noticias.csv")
         self.gdelt = GDELTSource(cache_dir, WHITELIST_FONTES)
         self.newsapi = NewsAPISource(cache_dir, WHITELIST_FONTES, self._news_api_key)
         # Contador de degradação do GDELT na sessão (rate limit / indisponível),
@@ -311,8 +314,11 @@ class JournalAgent:
         para o nome da empresa via TICKER_PARA_NOME, que rende mais resultados.
         """
         _validate_aware(data_limite, "data_limite")
+        # Bloomberg CSV é indexado por ticker; guardamos o ticker original antes
+        # de resolver para nome (que só beneficia a busca textual de GDELT/NewsAPI).
+        ticker_original = query
         query = TICKER_PARA_NOME.get(query, query)
-        cache_key = {"q": query, "dl": str(data_limite), "lb": lookback_days}
+        cache_key = {"q": query, "t": ticker_original, "dl": str(data_limite), "lb": lookback_days}
         cached = self._cache.get("get_noticias", cache_key)
         if cached is not None:
             logger.info("get_noticias('%s'): cache hit (%d notícias)", query, len(cached))
@@ -338,7 +344,7 @@ class JournalAgent:
                 logger.warning("Fonte de notícia %s falhou: %s", nome_fonte, e)
 
         # Camada 1 — Bloomberg CSV (curadoria manual, peso máximo)
-        _coletar("bloomberg_csv", lambda: self._bloomberg_csv(query, data_inicio, data_limite))
+        _coletar("bloomberg_csv", lambda: self._bloomberg_csv(ticker_original, data_inicio, data_limite))
         # Camada 2 — GDELT (volume histórico)
         _coletar("gdelt", lambda: self.gdelt.buscar(query, data_inicio, data_limite))
         # Camada 3 — NewsAPI (período recente; clampa 30 dias internamente)
@@ -383,75 +389,19 @@ class JournalAgent:
                 resultado.append(n)
         return resultado
 
-    @staticmethod
-    def _validar_colunas_bloomberg(df: pd.DataFrame, nome_arquivo: str) -> None:
-        """Valida que o CSV tem exatamente as colunas esperadas.
-
-        Levanta ValueError com mensagem clara apontando quais colunas estão
-        faltando ou sobrando. Estrutura errada é erro de dado, não algo a
-        ignorar silenciosamente.
-        """
-        presentes = set(df.columns)
-        esperadas = set(_BLOOMBERG_COLUNAS)
-        faltando = esperadas - presentes
-        extras = presentes - esperadas
-        if faltando or extras:
-            partes = []
-            if faltando:
-                partes.append(f"faltando {sorted(faltando)}")
-            if extras:
-                partes.append(f"inesperadas {sorted(extras)}")
-            raise ValueError(
-                f"CSV Bloomberg '{nome_arquivo}' com colunas inválidas: "
-                f"{'; '.join(partes)}. Esperado exatamente: {list(_BLOOMBERG_COLUNAS)}"
-            )
-
     def _bloomberg_csv(
         self,
-        query: str,
+        ticker: str,
         data_inicio: pd.Timestamp,
         data_limite: pd.Timestamp,
     ) -> list[Noticia]:
-        result: list[Noticia] = []
-        if not self._bloomberg_dir.exists():
-            return result
-        termos = query.lower().split()
-        for csv_path in self._bloomberg_dir.glob("*.csv"):
-            df = pd.read_csv(csv_path, dtype=str).fillna("")
-            self._validar_colunas_bloomberg(df, csv_path.name)
-            logger.debug("Bloomberg CSV %s: %d linhas", csv_path.name, len(df))
-            for idx, row in df.iterrows():
-                raw = row.get("data_publicacao", "")
-                try:
-                    pub = pd.Timestamp(raw)
-                    if pub.tzinfo is None:
-                        pub = pub.tz_localize(FUSO)
-                    else:
-                        pub = pub.tz_convert(FUSO)
-                except Exception:
-                    # Linha com timestamp inválido: avisa (com nº da linha no
-                    # arquivo, +2 = cabeçalho + base 1) e pula só esta linha.
-                    logger.warning(
-                        "Bloomberg CSV %s linha %d: data_publicacao inválida %r; pulando linha",
-                        csv_path.name, idx + 2, raw,
-                    )
-                    continue
-                if not (data_inicio <= pub <= data_limite):
-                    continue
-                titulo = row.get("titulo", "")
-                conteudo = row.get("conteudo", "")
-                if termos and not any(t in f"{titulo} {conteudo}".lower() for t in termos):
-                    continue
-                result.append(Noticia(
-                    titulo=titulo,
-                    conteudo=conteudo,
-                    url=row.get("url", ""),
-                    publicado_em=pub,
-                    fonte="bloomberg_csv",
-                    peso_fonte=1.0,
-                    ticker=row.get("ticker") or None,
-                ))
-        return result
+        """Camada 1 (Bloomberg, peso 1.0): delega ao BloombergCSVSource (Etapa 2).
+
+        Recebe o TICKER original (ex: "PETR4.SA"), não o nome resolvido — o CSV
+        parseado é indexado por ticker. Fonte local determinística; qualquer
+        falha é isolada pela cascata (`_coletar`), como nas demais camadas.
+        """
+        return self.bloomberg.buscar(ticker, data_inicio, data_limite)
 
     # ── 2. Preços ─────────────────────────────────────────────────────────────
 
