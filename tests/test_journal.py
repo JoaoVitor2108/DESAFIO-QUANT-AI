@@ -397,6 +397,10 @@ class TestGetNoticias:
         def _spy(query, *a, **k):
             capturado["query"] = query
             return []
+        # Força cache miss: get_noticias retorna cedo no cache hit, sem tocar
+        # nas fontes. O teste valida a resolução ticker→nome, não o cache, e
+        # não pode depender de a Bloomberg ter (ou não) notícia nesta janela.
+        monkeypatch.setattr(_AGENT._cache, "get", lambda *a, **k: None)
         monkeypatch.setattr(_AGENT.gdelt, "buscar", _spy)
         monkeypatch.setattr(_AGENT.newsapi, "buscar", lambda *a, **k: [])
         _AGENT.get_noticias("PETR4.SA", ts("2024-05-31 12:03"))

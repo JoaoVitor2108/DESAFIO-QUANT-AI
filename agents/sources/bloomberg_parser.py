@@ -3,13 +3,21 @@ Parser dos dados brutos de notícias do Bloomberg Terminal → CSV do JEMPO.
 
 O João coletou notícias manualmente no Terminal Bloomberg da biblioteca da FGV
 (copiar/colar da tela TOP News) e salvou num Excel com uma aba por ticker. Cada
-aba traz, na **coluna A**, blocos de notícia completos no formato do Terminal,
-poluídos por "chrome" da interface (`<Back> Voltar`, barra de ferramentas,
-`Painel gráfico »`, tags `<TICKER> BZ Equity`).
+aba traz blocos de notícia completos no formato do Terminal, poluídos por
+"chrome" da interface (`<Back> Voltar`, barra de ferramentas, `Painel gráfico »`,
+tags `<TICKER> BZ Equity`).
 
-As colunas B–I de cada aba contêm um índice tabular só-headline com datas
-corrompidas (espalhadas de 1930 a 2029) — descartado de propósito: não tem
-corpo, não está no formato descrito e envenenaria o corte anti-lookahead.
+Os blocos ficam normalmente na coluna A, mas parte das abas da 2ª coleta traz
+todos (EGIE3) ou alguns (RDOR3, BBSE3) deslocados para a coluna B. Por isso A e
+B são parseadas como fluxos independentes e unidas — ver `_parsear_worksheet`.
+
+Abas cujo nome comercial diverge do ticker do `UNIVERSO_HISTORICO` passam por
+`TICKER_ALIAS` (hoje só `AXIA3` → `ELET3`, rebrand pós-privatização).
+
+Da coluna D em diante há um índice tabular só-headline com datas corrompidas
+(espalhadas de 1930 a 2029) — descartado de propósito: não tem corpo, não está
+no formato descrito e envenenaria o corte anti-lookahead. Ele nunca casa com a
+âncora `MM/DD/YYYY HH:MM:SS[CODE]`, então não entra pelo caminho de A/B.
 
 Esta é a Etapa 1 (parser + CSV). A integração com o JournalAgent é a Etapa 2,
 separada — aqui apenas produzimos o CSV no schema esperado.
@@ -50,6 +58,14 @@ _MAPA_FONTE = {
     "BI": "Bloomberg Intelligence",
 }
 _FONTE_GENERICA = "Bloomberg"
+
+# Nome de aba do Terminal → ticker do UNIVERSO_HISTORICO, quando divergem.
+# O universo é a fonte de verdade; remapear aqui mantém a correção localizada
+# e reversível, sem tocar no histórico 2019-2023 já treinado.
+TICKER_ALIAS = {
+    "AXIA3": "ELET3",  # rebrand pós-privatização (2024); universo JEMPO usa o
+                       # nome histórico ELET3 para consistência com 2019-2023
+}
 
 # ── Regex compilados (fora dos loops, por performance) ────────────────────────
 
@@ -142,8 +158,13 @@ class _RelatorioAba:
 
 
 def ticker_da_aba(aba: str) -> str:
-    """Nome da aba → ticker com sufixo .SA (`petr4` → `PETR4.SA`)."""
-    return f"{aba.strip().upper()}{_SUFIXO_TICKER}"
+    """Nome da aba → ticker com sufixo .SA (`petr4` → `PETR4.SA`).
+
+    Aplica `TICKER_ALIAS` antes do sufixo, para abas que usam um nome comercial
+    diferente do adotado no universo (`AXIA3` → `ELET3.SA`).
+    """
+    nome = aba.strip().upper()
+    return f"{TICKER_ALIAS.get(nome, nome)}{_SUFIXO_TICKER}"
 
 
 def mapear_codigo_fonte(codigo: str) -> tuple[str, bool]:
@@ -405,19 +426,65 @@ def escrever_csv(noticias: list[NoticiaBloomberg], caminho: Path) -> None:
 # ── Orquestração: Excel → notícias + CSV ───────────────────────────────────────
 
 
-def _texto_coluna_a(worksheet) -> str:
-    """Concatena as células não-vazias da coluna A da aba com `\\n`."""
+def _texto_coluna(worksheet, indice: int) -> str:
+    """Concatena as células não-vazias de uma coluna (0=A, 1=B) com `\\n`."""
+    col = indice + 1
     linhas = [
         str(cell.value)
-        for (cell,) in worksheet.iter_rows(min_col=1, max_col=1)
+        for (cell,) in worksheet.iter_rows(min_col=col, max_col=col)
         if cell.value not in (None, "")
     ]
     return "\n".join(linhas)
 
 
-def _aba_vazia(worksheet) -> bool:
-    """Detecta aba vazia (dimensão 1x1, sem conteúdo na coluna A)."""
-    return worksheet.max_row <= 1 and worksheet.max_column <= 1
+def _detectar_coluna_conteudo(worksheet) -> int:
+    """Índice da coluna com mais date-lines: 0 (A), 1 (B), ou -1 se nenhuma.
+
+    Parte das abas exportadas do Terminal traz os blocos deslocados uma coluna
+    à direita. A âncora `MM/DD/YYYY HH:MM:SS[CODE]` distingue conteúdo real do
+    índice tabular só-headline (que fica da coluna D em diante e nunca casa com
+    a âncora), então contá-la é seguro para escolher a coluna.
+    """
+    contagens = [
+        len(_RE_DATA_FONTE.findall(_texto_coluna(worksheet, i)))
+        for i in (0, 1)
+    ]
+    if max(contagens) == 0:
+        return -1
+    return contagens.index(max(contagens))
+
+
+def _parsear_worksheet(worksheet, aba: str) -> tuple[list[NoticiaBloomberg], _RelatorioAba]:
+    """Parseia as colunas A e B da aba, unindo os resultados.
+
+    As duas colunas são parseadas como fluxos independentes porque abas reais
+    trazem blocos divididos entre A e B (o Terminal desloca parte da colagem).
+    Escolher só a coluna dominante descartaria notícias legítimas da outra. Uma
+    coluna sem âncoras não abre bloco algum e contribui com zero notícias, de
+    modo que o índice tabular residual continua fora do resultado.
+    """
+    noticias: list[NoticiaBloomberg] = []
+    rel_total = _RelatorioAba()
+    vistas: set[tuple[str, str]] = set()
+
+    for indice in (0, 1):
+        parciais, rel = parsear_texto_aba(_texto_coluna(worksheet, indice), aba)
+        for n in parciais:
+            chave = (n.data.isoformat(), n.titulo)
+            if chave in vistas:
+                rel_total.n_duplicatas_removidas += 1
+                continue
+            vistas.add(chave)
+            noticias.append(n)
+        for c in rel.codigos_fonte_desconhecidos:
+            if c not in rel_total.codigos_fonte_desconhecidos:
+                rel_total.codigos_fonte_desconhecidos.append(c)
+        rel_total.n_duplicatas_removidas += rel.n_duplicatas_removidas
+        rel_total.n_puladas_titulo_vazio += rel.n_puladas_titulo_vazio
+        rel_total.n_puladas_data_invalida += rel.n_puladas_data_invalida
+        rel_total.avisos.extend(rel.avisos)
+
+    return noticias, rel_total
 
 
 def parsear_excel_bloomberg(
@@ -443,13 +510,12 @@ def parsear_excel_bloomberg(
 
     for aba in wb.sheetnames:
         ws = wb[aba]
-        if _aba_vazia(ws):
+        if _detectar_coluna_conteudo(ws) == -1:
             abas_vazias.append(aba)
-            logger.warning("Aba %r vazia (1x1); pulando", aba)
+            logger.warning("Aba %r sem date-lines em A nem B; pulando", aba)
             continue
 
-        texto = _texto_coluna_a(ws)
-        noticias, rel = parsear_texto_aba(texto, aba)
+        noticias, rel = _parsear_worksheet(ws, aba)
 
         todas.extend(noticias)
         n_por_ticker[ticker_da_aba(aba)] = len(noticias)

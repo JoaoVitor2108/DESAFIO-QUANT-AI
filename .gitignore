@@ -13,6 +13,11 @@ venv/
 # Dados pesados e cache
 data/cache/
 data/raw/
+# Excel brutos do Terminal Bloomberg: não redistribuíveis (licença Bloomberg).
+# O CSV parseado é regenerável via scripts/unificar_bloomberg.py.
+data/bloomberg/raw/*.xlsx
+# Backups do CSV parseado: mesmo conteúdo Bloomberg, mesma restrição.
+*.csv.bak
 data/cvm/raw/*.zip
 data/cvm/raw/cad_cia_aberta.csv
 data/cvm/processed/

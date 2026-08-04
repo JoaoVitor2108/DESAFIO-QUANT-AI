@@ -13,10 +13,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import openpyxl
+
 from agents.sources.bloomberg_parser import (
     NoticiaBloomberg,
     RelatorioParsing,
+    _detectar_coluna_conteudo,
     _limpar_chrome_residual,
+    _parsear_worksheet,
     escrever_csv,
     mapear_codigo_fonte,
     parsear_excel_bloomberg,
@@ -67,6 +71,18 @@ def test_parseia_data_bloomberg_correta():
     ts = parsear_timestamp_bloomberg("01/15/2025 14:30:00")
     assert ts is not None
     assert ts.isoformat() == "2025-01-15T14:30:00-03:00"
+
+
+def test_axia3_remapeado_para_elet3_por_alias():
+    # Rebrand pós-privatização: as abas da 2ª coleta vêm como AXIA3, mas o
+    # UNIVERSO_HISTORICO indexa a empresa pelo nome histórico ELET3.
+    assert ticker_da_aba("AXIA3") == "ELET3.SA"
+    assert ticker_da_aba("axia3") == "ELET3.SA"
+
+
+def test_ticker_sem_alias_mantem_original():
+    for aba in ("PETR4", "vale3", "BBSE3", "ASAI3", "ELET3"):
+        assert ticker_da_aba(aba) == f"{aba.upper()}.SA"
 
 
 def test_ticker_da_aba_ganha_sufixo_sa():
@@ -192,6 +208,48 @@ def test_aba_vazia_registra_e_nao_crasha():
     assert noticias == []
     assert rel.n_puladas_titulo_vazio == 0
     assert rel.n_puladas_data_invalida == 0
+
+
+# ── Grupo E — Coluna de conteúdo (A ou B) ────────────────────────────────────
+# Parte das abas exportadas do Terminal traz os blocos deslocados para a coluna
+# B. `_detectar_coluna_conteudo` reporta a coluna dominante pela contagem de
+# date-lines; -1 sinaliza aba sem conteúdo nenhum.
+
+
+def _aba_sintetica(linhas_por_coluna: dict[int, str]):
+    """Worksheet em memória com texto distribuído por coluna (1=A, 2=B)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for col, texto in linhas_por_coluna.items():
+        for i, linha in enumerate(texto.splitlines(), start=1):
+            ws.cell(row=i, column=col, value=linha)
+    return ws
+
+
+def test_detecta_coluna_a_quando_conteudo_em_a():
+    ws = _aba_sintetica({1: _texto(BLOCO_COMPLETO, BLOCO_SEM_RESUMO)})
+    assert _detectar_coluna_conteudo(ws) == 0
+
+
+def test_detecta_coluna_b_quando_conteudo_em_b():
+    ws = _aba_sintetica({2: _texto(BLOCO_COMPLETO, BLOCO_SEM_RESUMO)})
+    assert _detectar_coluna_conteudo(ws) == 1
+
+
+def test_detecta_coluna_retorna_menos_um_quando_aba_vazia():
+    ws = _aba_sintetica({1: "linha solta sem date-line\noutra linha\n"})
+    assert _detectar_coluna_conteudo(ws) == -1
+
+
+def test_parseia_aba_com_conteudo_dividido_entre_a_e_b():
+    # Caso real (RDOR3/BBSE3): parte dos blocos em A, parte em B. Nenhum
+    # dos dois lados pode ser descartado.
+    ws = _aba_sintetica({1: BLOCO_COMPLETO, 2: BLOCO_SEM_RESUMO})
+    noticias, _ = _parsear_worksheet(ws, "rdor3")
+    titulos = {n.titulo for n in noticias}
+    assert len(noticias) == 2, titulos
+    assert any("Petrobras Joins Debt Sale" in t for t in titulos)
+    assert any("Braskem Pulls From" in t for t in titulos)
 
 
 def test_encoding_utf8_com_acentos_portugueses():
