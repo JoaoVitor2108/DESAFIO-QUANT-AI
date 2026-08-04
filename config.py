@@ -214,6 +214,18 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "cd_cvm": 8133,
         "cnpj": "92.754.738/0001-62",
     },
+    # Substitui AMER3 na representação de varejo durante o backtest OOS.
+    # entrada IBOV: estimativa; confirmar via B3/Bloomberg.
+    "ASAI3.SA": {
+        "setor": "varejo",
+        "entrada": _ts("2021-05-03"),
+        "saida": None,
+        "confianca": "media",
+        "fonte": "Spin-off do GPA; 1º pregão 01/03/2021; entrada IBOV estimada "
+                 "no rebalanceamento de mai/2021",
+        "cd_cvm": 25372,
+        "cnpj": "06.057.223/0001-71",
+    },
     # TODO: verificar data exata de exclusão — estimativa rebalanceamento jan/2025
     "MGLU3.SA": {
         "setor": "varejo",
@@ -258,6 +270,19 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
         "cnpj": "53.113.791/0001-22",
     },
     # ── outros ────────────────────────────────────────────────────────────────
+    # Substitui IRBR3 na representação do setor durante o backtest OOS. Listada
+    # desde o IPO de abr/2013 e com negociação contínua antes de 2019; a
+    # composição do IBOV em jan/2019 não foi conferida em fonte primária B3,
+    # daí confianca="media".
+    "BBSE3.SA": {
+        "setor": "outros",
+        "entrada": None,
+        "saida": None,
+        "confianca": "media",
+        "fonte": "IPO BB Seguridade abr/2013; negociação contínua pré-2019",
+        "cd_cvm": 23159,
+        "cnpj": "17.344.597/0001-94",
+    },
     # Survivorship bias — padrão "lenta agonia": IRB revelou fraude contábil em
     # fev/2020 e caiu ~80%, mas só foi excluído do IBOV no rebalanceamento de
     # jan/2023. Demonstra que ticker permanece no universo até a saída formal,
@@ -340,9 +365,11 @@ TICKER_PARA_NOME: dict[str, str] = {
     "VIVT3.SA": "Vivo Telefônica Brasil",
     "RDOR3.SA": "Rede D'Or",
     "LREN3.SA": "Lojas Renner",
+    "ASAI3.SA": "Assaí Atacadista",
     "MGLU3.SA": "Magazine Luiza",
     "AMER3.SA": "Americanas",
     "CYRE3.SA": "Cyrela",
     "TOTS3.SA": "Totvs",
+    "BBSE3.SA": "BB Seguridade",
     "IRBR3.SA": "IRB Brasil Re",
 }

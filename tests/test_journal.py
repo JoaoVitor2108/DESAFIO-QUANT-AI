@@ -257,6 +257,44 @@ class TestTickersAtivos:
         assert "MGLU3.SA" not in ativos, "MGLU3 saiu no início de 2025"
         print(f"\nTickers ativos em 2025-06-30 ({len(ativos)}): {sorted(ativos)}")
 
+    # ── Substituições para o backtest OOS 2024-2025 ───────────────────────────
+    # AMER3 (varejo) e IRBR3 (outros) têm zero dias ativos em 2024-2025.
+    # ASAI3 e BBSE3 entram para preservar a representação desses setores no OOS
+    # sem remover os históricos, que o MATH&ML ainda usa no treino 2020-2023.
+
+    def test_asai3_ativo_em_2024_2025(self):
+        ativos = tickers_ativos(ts("2024-06-01"))
+        assert "ASAI3.SA" in ativos
+
+    def test_bbse3_ativo_em_2024_2025(self):
+        ativos = tickers_ativos(ts("2024-06-01"))
+        assert "BBSE3.SA" in ativos
+
+    def test_amer3_inativo_em_2024(self):
+        ativos = tickers_ativos(ts("2024-06-01"))
+        assert "AMER3.SA" not in ativos
+
+    def test_irbr3_inativo_em_2024_em_diante(self):
+        # IRBR3 saiu do IBOV em 02/01/2023 — zero dias ativos no OOS.
+        ativos = tickers_ativos(ts("2024-06-01"))
+        assert "IRBR3.SA" not in ativos
+
+    def test_universo_2024_2025_tem_24_tickers_ativos(self):
+        # Contagem ancorada em 2024-06-01: antes das saídas de MGLU3
+        # (06/01/2025) e JBSS3 (06/06/2025), que reduzem o universo depois.
+        ativos = tickers_ativos(ts("2024-06-01"))
+        assert len(ativos) == 24, f"esperado 24, veio {len(ativos)}: {sorted(ativos)}"
+
+    def test_amer3_ainda_ativo_em_2022(self):
+        # Sanity: AMER3 permanece disponível para o treino MATH&ML 2020-2023.
+        ativos = tickers_ativos(ts("2022-06-01"))
+        assert "AMER3.SA" in ativos
+
+    def test_irbr3_ativo_em_2019(self):
+        # Sanity: IRBR3 permanece disponível para o warmup de 2019.
+        ativos = tickers_ativos(ts("2019-06-03"))
+        assert "IRBR3.SA" in ativos
+
 
 # ── Anti-lookahead ────────────────────────────────────────────────────────────
 
