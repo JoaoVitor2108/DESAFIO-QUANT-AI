@@ -58,9 +58,33 @@ logger = logging.getLogger(__name__)
 # TRAINING_CUTOFF importa para risco de cola — ver segmentar_por_exposicao).
 RELIABLE_CUTOFF = pd.Timestamp("2025-02-28 23:59:59", tz=FUSO)  # reliable knowledge (fim de Feb/2025)
 TRAINING_CUTOFF = pd.Timestamp("2025-07-31 23:59:59", tz=FUSO)  # training data (fim de Jul/2025; fronteira anti-lookahead)
+# Fronteira LIMPA aplicada à DATA DA NOTÍCIA (não à data do pregão): um evento só
+# é "genuinamente limpo" se a notícia MAIS RECENTE dele é estritamente posterior
+# ao training cutoff. Mesma fronteira usada pelo gate de custo (85c69f9).
+CUTOFF_LIMPO = pd.Timestamp("2025-08-01 00:00:00", tz=FUSO)
 
 IC_META = 0.15
 RESULTS_DIR = Path(__file__).parent / "results"
+
+# Parâmetros do block bootstrap por data (travados; iguais aos do gate de custo).
+BLOCO_DIAS_UTEIS = 5
+N_BOOTSTRAP = 10_000
+SEED_BOOTSTRAP = 42
+
+# Preços USD por 1M tokens (fonte: referência claude-api). Única fonte de verdade
+# do custo — gate e calibração importam daqui.
+PRECOS = {
+    "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.00},
+    "claude-sonnet-4-6": {"in": 3.00, "out": 15.00},
+}
+MODELO_PADRAO = "claude-haiku-4-5-20251001"
+
+# Tokens típicos por chamada do ECON, retro-calculados do custo médio medido no
+# gate (318 avaliações Haiku, US$ 0.004707/chamada). Base da estimativa de custo
+# ANTES de gastar — o gate rodou nos 4 tickers com MAIS notícia, então é um teto
+# razoável para um universo mais amplo (contextos menores).
+TOKENS_IN_TIPICO = 3_200
+TOKENS_OUT_TIPICO = 310
 
 # Placeholder padrão do modo "anonimizar"
 _ANON_PLACEHOLDER = "a companhia"
@@ -191,6 +215,117 @@ def calcular_ic_com_ic(scores: Iterable[float], retornos: Iterable[float],
     }
 
 
+# ── Block bootstrap por data (canônico) ───────────────────────────────────────
+# Vive AQUI, não no gate de custo: é a camada estatística compartilhada por toda
+# a calibração. O gate (`gate_custo_haiku_vs_sonnet.py`) importa e reexporta.
+# Reconciliação do TODO do CONTEXTO_FIXO ("migrar comparar_modelos para block
+# bootstrap"): o bootstrap i.i.d. de `calcular_ic_com_ic` reamostra LINHAS e
+# subestima a incerteza quando retornos da mesma data são correlacionados.
+
+
+def adicionar_blocos(df: pd.DataFrame, col_data: str,
+                     data_inicio: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """Devolve uma CÓPIA de `df` com a coluna 'bloco' = índice do bloco de
+    `BLOCO_DIAS_UTEIS` dias úteis a que cada data pertence, contado a partir da
+    menor data (ou de `data_inicio`). Usa `np.busday_count` (só dias de semana —
+    precisão de calendário não é necessária para agrupar blocos de bootstrap)."""
+    import numpy as np
+
+    datas = np.array([pd.Timestamp(x).date() for x in df[col_data]],
+                     dtype="datetime64[D]")
+    base = (np.datetime64(pd.Timestamp(data_inicio).date(), "D")
+            if data_inicio is not None else datas.min())
+    blocos = np.busday_count(base, datas) // BLOCO_DIAS_UTEIS
+    out = df.copy()
+    out["bloco"] = blocos.astype(int)
+    return out
+
+
+def bootstrap_ic_bloco(df: pd.DataFrame, col_score: str, col_y: str,
+                       n_iter: int = N_BOOTSTRAP,
+                       seed: int = SEED_BOOTSTRAP) -> dict:
+    """IC de Spearman com IC95 via block bootstrap POR DATA. Reamostra blocos (de
+    `BLOCO_DIAS_UTEIS` dias úteis) com reposição `n_iter` vezes; percentis
+    2.5/97.5. Determinístico dada a seed. Requer a coluna 'bloco'."""
+    import numpy as np
+
+    s = df[col_score].to_numpy(dtype="float64")
+    y = df[col_y].to_numpy(dtype="float64")
+    blocos = df["bloco"].to_numpy()
+    unicos = np.unique(blocos)
+    grupos = [np.where(blocos == b)[0] for b in unicos]
+    n_b = len(unicos)
+    ic_pt = calcular_ic(s, y)
+    rng = np.random.default_rng(seed)
+    amostras = []
+    for _ in range(n_iter):
+        pick = rng.integers(0, n_b, n_b)
+        idx = np.concatenate([grupos[p] for p in pick])
+        v = calcular_ic(s[idx], y[idx])
+        if v == v:  # descarta NaN (reamostra degenerada)
+            amostras.append(v)
+    amostras = np.array(amostras) if amostras else np.array([ic_pt])
+    return {
+        "ic": float(ic_pt),
+        "ic95_low": float(np.percentile(amostras, 2.5)),
+        "ic95_high": float(np.percentile(amostras, 97.5)),
+        "n": int(len(df)),
+        "n_blocos": int(n_b),
+    }
+
+
+# ── Fronteira anti-lookahead por data da NOTÍCIA ──────────────────────────────
+
+
+def eh_evento_limpo(data_noticia: Optional[pd.Timestamp],
+                    cutoff: Optional[pd.Timestamp] = None) -> bool:
+    """True se a notícia MAIS RECENTE do evento é pós training cutoff do Haiku.
+
+    A contaminação vem do TEXTO que o modelo pode ter visto no treino, não do dia
+    do pregão: um evento de ago/2025 cuja notícia é de julho/2025 continua sujo.
+    Sem data de notícia → conservadoramente sujo."""
+    if data_noticia is None or pd.isna(data_noticia):
+        return False
+    return bool(pd.Timestamp(data_noticia) >= (cutoff if cutoff is not None else CUTOFF_LIMPO))
+
+
+# ── Deduplicação de eventos por conjunto de notícias ──────────────────────────
+
+
+def chave_conjunto_noticias(ticker: str, noticias: list) -> str:
+    """Chave determinística de (ticker, CONJUNTO de notícias), invariante à ordem.
+
+    O `get_noticias` usa lookback de 7 dias: o mesmo conjunto de notícias reaparece
+    em vários pregões vizinhos do mesmo ticker. Essas avaliações não são
+    observações independentes (limitação registrada no relatório do gate) e não
+    trazem informação nova — só custo de API. Esta chave permite manter UMA
+    avaliação por configuração de notícias."""
+    return f"{ticker}|{_hash_conjunto(noticias)}"
+
+
+def _hash_conjunto(noticias: list) -> str:
+    import hashlib
+
+    from agents.econ import _hash_noticia
+
+    raw = "||".join(sorted(_hash_noticia(n) for n in noticias))
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ── Estimativa de custo (hard cap) ────────────────────────────────────────────
+
+
+def estimar_custo_usd(n_eventos: int, modelo: str = MODELO_PADRAO,
+                      tokens_in: int = TOKENS_IN_TIPICO,
+                      tokens_out: int = TOKENS_OUT_TIPICO) -> float:
+    """Custo estimado em USD de `n_eventos` avaliações, ANTES de gastar.
+
+    Levanta KeyError para modelo sem preço registrado — melhor falhar do que
+    estimar zero e furar o hard cap."""
+    preco = PRECOS[modelo]
+    return n_eventos * (tokens_in / 1e6 * preco["in"] + tokens_out / 1e6 * preco["out"])
+
+
 # ── v4-P5: classificação de degradação ─────────────────────────────────────────
 
 # Marcadores nos `avisos` que indicam degradação REAL (não a mera divergência P7).
@@ -215,34 +350,58 @@ def classificar_degradacao(score) -> Optional[str]:
 
 # ── v4-C3: baseline de sentimento lexical simples ──────────────────────────────
 
-# Listas mínimas curadas (BR-PT). NÃO pretende ser bom — é só o ponto de comparação
-# contra o qual medimos o valor agregado do raciocínio do LLM (GAP de IC, v4-C3).
+# Listas mínimas curadas, BILÍNGUES (BR-PT + EN). NÃO pretende ser bom — é só o
+# ponto de comparação contra o qual medimos o valor agregado do raciocínio do LLM
+# (GAP de IC, v4-C3).
+# O inglês NÃO é enfeite: o dataset Bloomberg é majoritariamente em inglês
+# (só ~13% dos títulos tocam o léxico PT). Um B0 só-PT sairia quase todo zero e o
+# GAP seria vitória de régua torta — o baseline tem que ser um competidor honesto.
 _PALAVRAS_POS = {
+    # PT
     "lucro", "alta", "crescimento", "recorde", "expansão", "ganho", "valorização",
     "aprovação", "dividendo", "receita", "superávit", "melhora", "forte", "positivo",
     "aumento", "avanço", "otimista", "supera", "elevação", "robusto", "demanda",
     "contrato", "aquisição", "investimento", "eficiência", "margem", "recuperação",
     "sobe", "disparada", "premiada",
+    # EN
+    "beat", "beats", "rise", "rises", "gain", "gains", "surge", "surges", "jump",
+    "jumps", "rally", "rallies", "record", "growth", "profit", "upgrade", "upgraded",
+    "outperform", "raise", "raises", "raised", "dividend", "dividends", "approve",
+    "approves", "approved", "win", "wins", "boost", "boosts", "strong", "higher",
+    "top", "tops", "expansion", "recovery", "advance", "advances", "climb", "climbs",
+    "soar", "soars", "best", "buyback", "beating",
 }
 _PALAVRAS_NEG = {
+    # PT
     "prejuízo", "queda", "perda", "recuo", "investigação", "fraude", "multa",
     "rebaixamento", "dívida", "calote", "crise", "demissão", "fechamento", "greve",
     "processo", "despencou", "negativo", "fraco", "redução", "atraso", "default",
     "escândalo", "rombo", "suspensão", "deficit", "tombo", "alerta", "risco",
     "cai", "desvalorização",
+    # EN
+    "drop", "drops", "fall", "falls", "miss", "misses", "loss", "losses", "cut",
+    "cuts", "downgrade", "downgraded", "underperform", "slump", "slumps", "plunge",
+    "plunges", "decline", "declines", "weak", "lower", "warn", "warns", "probe",
+    "fine", "fined", "fraud", "strike", "layoffs", "debt", "risk", "worst", "halt",
+    "halts", "halted", "sink", "sinks", "tumble", "tumbles", "delay", "delays",
+    "lawsuit", "missing", "slide", "slides", "sued",
 }
+# Tokenizador bilíngue: aceita acentos do PT e ASCII do EN.
+_RX_TOKEN = re.compile(r"[a-záàâãéêíóôõúç]+")
 
 
-def baseline_sentimento_simples(noticias) -> float:
+def baseline_sentimento_simples(noticias, apenas_titulo: bool = False) -> float:
     """Score de sentimento lexical em [-1, +1] (v4-C3 — baseline trivial).
 
-    Conta palavras positivas/negativas no título+conteúdo. (pos-neg)/(pos+neg).
+    Conta palavras positivas/negativas e devolve (pos-neg)/(pos+neg).
+    `apenas_titulo=True` restringe ao título: é a forma usada como baseline B0 da
+    calibração, porque o corpo Bloomberg traz o artigo inteiro (incluindo
+    comentários de analista dos dois lados) e afogaria o sinal da manchete.
     """
-    import re as _re
     pos = neg = 0
     for n in noticias:
-        texto = f"{n.titulo} {n.conteudo or ''}".lower()
-        tokens = _re.findall(r"[a-záàâãéêíóôõúç]+", texto)
+        texto = n.titulo if apenas_titulo else f"{n.titulo} {n.conteudo or ''}"
+        tokens = _RX_TOKEN.findall(texto.lower())
         pos += sum(t in _PALAVRAS_POS for t in tokens)
         neg += sum(t in _PALAVRAS_NEG for t in tokens)
     total = pos + neg
@@ -549,10 +708,15 @@ def comparar_modelos(journal, eventos: Iterable[tuple],
                      cache_dir=Path("data/cache")) -> dict:
     """Roda os MESMOS eventos no MESMO prompt em cada modelo e compara (v4-C5).
 
-    Reporta, por modelo, IC (com IC95 bootstrap) e — onde estimável — custo; e a
-    concordância (% de scores com |Δ| < 0.2). Recomenda-se um subset da janela
-    LIMPA (pós-jul/2025) para evitar cola de memória diferencial entre modelos.
-    Gated em ANTHROPIC_API_KEY.
+    Reporta, por modelo, IC com IC95 por BLOCK BOOTSTRAP POR DATA (blocos de
+    `BLOCO_DIAS_UTEIS` dias úteis, `N_BOOTSTRAP` iterações, seed
+    `SEED_BOOTSTRAP`) e a concordância (% de scores com |Δ| < 0.2). Recomenda-se
+    um subset da janela LIMPA (pós-jul/2025) para evitar cola de memória
+    diferencial entre modelos. Gated em ANTHROPIC_API_KEY.
+
+    Reconciliação (antes usava bootstrap i.i.d.): retornos de datas próximas são
+    correlacionados, então reamostrar LINHAS subestima a largura do IC95. O gate
+    de custo já usava block bootstrap; agora as duas rotinas concordam.
     """
     from agents.econ import EconAgent
 
@@ -561,7 +725,7 @@ def comparar_modelos(journal, eventos: Iterable[tuple],
     scores_por_modelo = {}
     for modelo in modelos:
         agent = EconAgent(journal=journal, model=modelo, cache_dir=cache_dir)
-        scores, excessos = [], []
+        linhas = []
         for ticker, data_limite in eventos:
             noticias = journal.get_noticias(ticker, data_limite)
             if not noticias:
@@ -572,10 +736,14 @@ def comparar_modelos(journal, eventos: Iterable[tuple],
             exc = _retorno_excesso_5d(journal, ticker, data_limite)
             if exc is None:
                 continue
-            scores.append(s.score_total)
-            excessos.append(exc)
-        scores_por_modelo[modelo] = scores
-        por_modelo[modelo] = {"ic": calcular_ic_com_ic(scores, excessos), "n": len(scores)}
+            linhas.append({"data": data_limite, "score": s.score_total, "y": exc})
+        df = pd.DataFrame(linhas)
+        scores_por_modelo[modelo] = [linha["score"] for linha in linhas]
+        ic = (bootstrap_ic_bloco(adicionar_blocos(df, "data"), "score", "y")
+              if not df.empty else
+              {"ic": float("nan"), "ic95_low": float("nan"),
+               "ic95_high": float("nan"), "n": 0, "n_blocos": 0})
+        por_modelo[modelo] = {"ic": ic, "n": len(df)}
 
     # Concordância par-a-par (só se os modelos cobriram os mesmos eventos)
     concordancia = None

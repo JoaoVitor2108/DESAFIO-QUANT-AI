@@ -5,6 +5,7 @@ A orquestração ao vivo (`calibrar`, `teste_placebo`) depende de chave + amostr
 notícias e não é exercida aqui; cobrimos a lógica isolada que sustenta o relatório
 de mitigação de viés. Execute: pytest tests/test_econ_calibration.py -v
 """
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -23,7 +24,14 @@ from calibration.econ_calibration import (
     contar_eventos_por_segmento,
     baseline_sentimento_simples,
     diagnosticar_colinearidade,
+    adicionar_blocos,
+    bootstrap_ic_bloco,
+    chave_conjunto_noticias,
+    eh_evento_limpo,
+    estimar_custo_usd,
     _beta_setorial,
+    CUTOFF_LIMPO,
+    PRECOS,
     RELIABLE_CUTOFF,
     TRAINING_CUTOFF,
 )
@@ -253,6 +261,22 @@ class TestBaseline:
         n = _noticia("Empresa realiza assembleia ordinária na data prevista")
         assert baseline_sentimento_simples([n]) == 0.0
 
+    def test_manchete_em_ingles_positiva(self):
+        """O dataset Bloomberg é majoritariamente em inglês: um léxico só em PT
+        deixaria o baseline B0 degenerado (quase todo zero) e o GAP contra o ECON
+        sem significado."""
+        n = _noticia("Ambev 2Q Net Revenue Beats Estimates")
+        assert baseline_sentimento_simples([n]) > 0
+
+    def test_manchete_em_ingles_negativa(self):
+        n = _noticia("Ambev Drops After 4Q Net Revenue Misses Estimates")
+        assert baseline_sentimento_simples([n]) < 0
+
+    def test_apenas_titulo_ignora_o_corpo(self):
+        n = _noticia("Company Beats Estimates", "prejuízo queda perda recuo crise")
+        assert baseline_sentimento_simples([n], apenas_titulo=True) > 0
+        assert baseline_sentimento_simples([n], apenas_titulo=False) < 0
+
 
 # ── v4-C4: diagnóstico de colinearidade implícita ──────────────────────────────
 
@@ -268,3 +292,172 @@ class TestColinearidade:
         out = diagnosticar_colinearidade(scores, contextos)
         assert out["roe"] == pytest.approx(1.0, abs=1e-9)
         assert abs(out["pl"]) < 1e-9 or pd.isna(out["pl"])  # pl constante → ~0/NaN
+
+
+# ── Block bootstrap por data (canônico aqui; o gate reexporta) ─────────────────
+
+
+class TestBlockBootstrap:
+    """Os blocos de 5 dias úteis e o bootstrap por bloco vivem AQUI (camada
+    estatística compartilhada). O gate de custo passa a importar daqui — é a
+    reconciliação do TODO 'migrar comparar_modelos para block bootstrap'."""
+
+    def test_blocos_agrupam_5_dias_uteis(self):
+        datas = [ts("2025-07-01"), ts("2025-07-04"), ts("2025-07-08")]
+        out = adicionar_blocos(pd.DataFrame({"data": datas}), "data")
+        assert out.loc[0, "bloco"] == out.loc[1, "bloco"] == 0
+        assert out.loc[2, "bloco"] == 1
+
+    def test_nao_muta_o_dataframe_original(self):
+        df = pd.DataFrame({"data": [ts("2025-07-01")]})
+        adicionar_blocos(df, "data")
+        assert "bloco" not in df.columns
+
+    def test_bootstrap_bloco_deterministico_e_reporta_n_blocos(self):
+        df = pd.DataFrame({
+            "score": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "bloco": [0, 0, 0, 1, 1, 1],
+        })
+        r1 = bootstrap_ic_bloco(df, "score", "y", n_iter=500, seed=7)
+        r2 = bootstrap_ic_bloco(df, "score", "y", n_iter=500, seed=7)
+        assert r1["ic"] == pytest.approx(1.0)
+        assert r1["n_blocos"] == 2
+        assert (r1["ic95_low"], r1["ic95_high"]) == (r2["ic95_low"], r2["ic95_high"])
+
+    def test_ic95_por_bloco_e_mais_largo_que_iid(self):
+        """Retornos correlacionados DENTRO do bloco: o bootstrap i.i.d. subestima a
+        incerteza. É exatamente por isso que a calibração migra para block bootstrap."""
+        rng = np.random.default_rng(3)
+        n_blocos, por_bloco = 12, 5
+        blocos = np.repeat(np.arange(n_blocos), por_bloco)
+        efeito = rng.normal(size=n_blocos)          # choque comum a cada bloco
+        score = efeito[blocos] + rng.normal(scale=0.1, size=n_blocos * por_bloco)
+        y = efeito[blocos] + rng.normal(scale=0.1, size=n_blocos * por_bloco)
+        df = pd.DataFrame({"score": score, "y": y, "bloco": blocos})
+
+        por_bloco_r = bootstrap_ic_bloco(df, "score", "y", n_iter=2000, seed=42)
+        iid = calcular_ic_com_ic(df["score"], df["y"], n_bootstrap=2000, seed=42)
+
+        largura_bloco = por_bloco_r["ic95_high"] - por_bloco_r["ic95_low"]
+        largura_iid = iid["ic95_high"] - iid["ic95_low"]
+        assert largura_bloco > largura_iid
+
+
+# ── Fronteira anti-lookahead por DATA DA NOTÍCIA (não por data do evento) ──────
+
+
+class TestEventoLimpo:
+    """R1: o que define contaminação é a data da NOTÍCIA, não a do pregão. Um
+    evento de 2025-08-05 cuja notícia mais recente é de julho/2025 está sujo."""
+
+    def test_noticia_pos_cutoff_e_limpa(self):
+        assert eh_evento_limpo(ts("2025-09-10")) is True
+
+    def test_noticia_pre_cutoff_e_suja(self):
+        assert eh_evento_limpo(ts("2025-07-31 23:00")) is False
+
+    def test_fronteira_exata_e_limpa(self):
+        assert eh_evento_limpo(CUTOFF_LIMPO) is True
+
+    def test_sem_data_de_noticia_e_suja(self):
+        assert eh_evento_limpo(None) is False
+
+    def test_cutoff_e_posterior_ao_training_cutoff(self):
+        assert CUTOFF_LIMPO > TRAINING_CUTOFF
+
+
+# ── Deduplicação de eventos por conjunto de notícias ──────────────────────────
+
+
+class TestChaveConjuntoNoticias:
+    """O lookback de 7du faz o MESMO conjunto de notícias ser pontuado em vários
+    pregões vizinhos: nem observações independentes, nem informação nova — só
+    custo de API. A chave permite manter uma avaliação por configuração."""
+
+    def test_mesmo_conjunto_mesma_chave_independente_da_ordem(self):
+        a, b = _noticia("Lucro sobe"), _noticia("Dívida cai")
+        assert chave_conjunto_noticias("PETR4.SA", [a, b]) == \
+               chave_conjunto_noticias("PETR4.SA", [b, a])
+
+    def test_conjunto_diferente_muda_a_chave(self):
+        a, b = _noticia("Lucro sobe"), _noticia("Dívida cai")
+        assert chave_conjunto_noticias("PETR4.SA", [a]) != \
+               chave_conjunto_noticias("PETR4.SA", [a, b])
+
+    def test_ticker_diferente_muda_a_chave(self):
+        a = _noticia("Lucro sobe")
+        assert chave_conjunto_noticias("PETR4.SA", [a]) != \
+               chave_conjunto_noticias("VALE3.SA", [a])
+
+
+# ── Estimativa de custo (hard cap R3) ─────────────────────────────────────────
+
+
+class TestEstimarCusto:
+    def test_estimativa_bate_com_a_formula_de_precos(self):
+        p = PRECOS["claude-haiku-4-5-20251001"]
+        esperado = 100 * (3000 / 1e6 * p["in"] + 300 / 1e6 * p["out"])
+        assert estimar_custo_usd(100, tokens_in=3000, tokens_out=300) == \
+               pytest.approx(esperado)
+
+    def test_escala_linearmente_com_n(self):
+        um = estimar_custo_usd(1)
+        assert estimar_custo_usd(500) == pytest.approx(500 * um)
+
+    def test_modelo_desconhecido_levanta(self):
+        with pytest.raises(KeyError):
+            estimar_custo_usd(10, modelo="modelo-que-nao-existe")
+
+
+# ── comparar_modelos migrado para block bootstrap ─────────────────────────────
+
+
+class TestCompararModelosUsaBlockBootstrap:
+    """Divergência metodológica registrada no CONTEXTO_FIXO: `comparar_modelos`
+    usava bootstrap i.i.d. enquanto o gate usava block bootstrap por data. Aqui a
+    reconciliação vira teste — o relatório precisa trazer `n_blocos`."""
+
+    @staticmethod
+    def _preparar(monkeypatch):
+        import agents.econ as econ_mod
+        import calibration.econ_calibration as cal
+
+        class _AgenteFake:
+            def __init__(self, *a, model="m", **k):
+                self.model = model
+
+            def avaliar(self, ticker, data_limite, noticias_override=None, **k):
+                # score determinístico e monotônico no dia do mês → IC bem definido
+                s = _score([], confianca=0.8)
+                s.score_total = data_limite.day / 100.0
+                return s
+
+        monkeypatch.setattr(econ_mod, "EconAgent", _AgenteFake)
+        monkeypatch.setattr(cal, "_retorno_excesso_5d",
+                            lambda journal, t, d, ajuste_beta=False: d.day / 100.0)
+        journal = MagicMock()
+        journal.get_noticias.return_value = [_noticia("Lucro recorde")]
+        return journal
+
+    def test_relatorio_traz_n_blocos_por_modelo(self, monkeypatch):
+        from calibration.econ_calibration import comparar_modelos
+
+        journal = self._preparar(monkeypatch)
+        eventos = [("PETR4.SA", ts(f"2025-09-{d:02d}")) for d in range(1, 21)]
+
+        out = comparar_modelos(journal, eventos, modelos=("modelo-a",))
+
+        ic = out["por_modelo"]["modelo-a"]["ic"]
+        assert "n_blocos" in ic, "comparar_modelos ainda usa bootstrap i.i.d."
+        assert ic["n_blocos"] < ic["n"], "blocos de 5du devem agrupar várias datas"
+
+    def test_deterministico_com_a_mesma_seed(self, monkeypatch):
+        from calibration.econ_calibration import comparar_modelos
+
+        journal = self._preparar(monkeypatch)
+        eventos = [("PETR4.SA", ts(f"2025-09-{d:02d}")) for d in range(1, 21)]
+
+        a = comparar_modelos(journal, eventos, modelos=("modelo-a",))
+        b = comparar_modelos(journal, eventos, modelos=("modelo-a",))
+        assert a["por_modelo"]["modelo-a"]["ic"] == b["por_modelo"]["modelo-a"]["ic"]

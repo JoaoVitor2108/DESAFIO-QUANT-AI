@@ -3,13 +3,12 @@
 Responde UMA pergunta: "vale a pena pagar 3x mais pelo Sonnet 4.6 vs Haiku 4.5?".
 NÃO é calibração completa: não itera prompt, não roda placebo, não roda auditoria
 de justificativas. Reusa os helpers PUROS e testados de
-`calibration/econ_calibration.py` (IC de Spearman, target beta-ajustado 5du sem
-lookahead, beta setorial, classificação de degradação, segmentação por cutoff) e
+`calibration/econ_calibration.py` (IC de Spearman, block bootstrap por data,
+target beta-ajustado 5du sem lookahead, beta setorial, classificação de
+degradação, segmentação por cutoff) e a infra de rodada paga de
+`calibration/exec_infra.py` (captura de custo/latência, checkpoint, retry), e
 adiciona só o que falta para o gate:
 
-  - block bootstrap POR DATA (blocos de 5 dias úteis) — o bootstrap de
-    `econ_calibration` é i.i.d.; retornos por data são correlacionados, então o
-    gate usa reamostragem por bloco (não i.i.d.);
   - ΔIC pareado (mesmos blocos reamostrados para os dois modelos → covariância
     preservada);
   - captura de custo real (tokens × preço), latência ISOLADA do LLM (só
@@ -37,11 +36,27 @@ import pandas as pd
 
 from config import FUSO, tickers_ativos
 from calibration.econ_calibration import (
+    BLOCO_DIAS_UTEIS,
+    CUTOFF_LIMPO,
+    N_BOOTSTRAP,
+    PRECOS,
+    SEED_BOOTSTRAP,
     TRAINING_CUTOFF,
     _retorno_excesso_5d,
+    adicionar_blocos,
+    bootstrap_ic_bloco,
     calcular_ic,
     classificar_degradacao,
     segmentar_por_exposicao,
+)
+from calibration.exec_infra import (
+    _CALLS,
+    CHECKPOINT_A_CADA,
+    MAX_RETRY_AVALIAR,
+    Checkpoint as _Checkpoint,
+    avaliar_com_retry as _avaliar_com_retry,
+    calendario_pregoes as _calendario_pregoes,
+    instalar_captura as _instalar_captura,
 )
 
 logger = logging.getLogger("gate_custo")
@@ -51,32 +66,19 @@ logger = logging.getLogger("gate_custo")
 MODELO_HAIKU = "claude-haiku-4-5-20251001"
 MODELO_SONNET = "claude-sonnet-4-6"
 
-# Preços USD por 1M tokens (fonte: referência claude-api). Constantes explícitas,
-# uma única vez — nada hard-coded espalhado.
-PRECOS = {
-    MODELO_HAIKU: {"in": 1.00, "out": 5.00},
-    MODELO_SONNET: {"in": 3.00, "out": 15.00},
-}
-
 N_ALVO = 100
 N_MIN = 40  # piso: abaixo disso o IC95 do ΔIC fica largo demais p/ decidir → aborta
 # Janela LIMPA do Haiku 4.5: estritamente PÓS training cutoff (2025-07-31). Jul/2025
 # está no treino → contamina. Fronteira exata: data_noticia_mais_recente >= CUTOFF_LIMPO.
 JANELA_INICIO = pd.Timestamp("2025-08-01", tz=FUSO)
 JANELA_FIM = pd.Timestamp("2025-12-31 23:59:59", tz=FUSO)
-CUTOFF_LIMPO = pd.Timestamp("2025-08-01 00:00:00", tz=FUSO)
 
-BLOCO_DIAS_UTEIS = 5
-N_BOOTSTRAP = 10_000
-SEED_BOOTSTRAP = 42
 SEED_AMOSTRA = 42
 
 SLEEP_ENTRE_CHAMADAS_S = 1.0     # rate-limit safe (ambos os modelos são pagos)
 CUSTO_HARD_CAP_USD = 8.0         # 2x a estimativa (~US$2); estourar = algo errado
 MAX_PROBES = 5000                # teto de sondagens (>= candidatos p/ exaurir todos os eventos)
 CREDITO_INICIAL_USD = 10.0       # crédito no console Anthropic (para o relatório de gasto)
-MAX_RETRY_AVALIAR = 3            # tentativas por evento antes de pular (backoff exponencial)
-CHECKPOINT_A_CADA = 10           # grava checkpoint incremental a cada N avaliações
 
 # Critério de decisão (idêntico aos gaps de econ_calibration v4-C5).
 GAP_ADOTAR_SONNET = 0.05
@@ -96,55 +98,6 @@ def decidir_modelo(delta_ic: float) -> str:
     'haiku' (cobre ΔIC < 0.03 E a zona cinza 0.03 ≤ ΔIC ≤ 0.05, ambos → Haiku por
     custo-benefício)."""
     return "sonnet" if delta_ic > GAP_ADOTAR_SONNET else "haiku"
-
-
-def adicionar_blocos(
-    df: pd.DataFrame, col_data: str, data_inicio: pd.Timestamp | None = None
-) -> pd.DataFrame:
-    """Adiciona coluna 'bloco' = índice do bloco de `BLOCO_DIAS_UTEIS` dias úteis a
-    que cada data pertence, contado a partir da menor data (ou de `data_inicio`).
-    Usa `np.busday_count` (só dias de semana — precisão de calendário não é
-    necessária para agrupar blocos de bootstrap)."""
-    datas = np.array([pd.Timestamp(x).date() for x in df[col_data]],
-                     dtype="datetime64[D]")
-    base = (np.datetime64(pd.Timestamp(data_inicio).date(), "D")
-            if data_inicio is not None else datas.min())
-    blocos = np.busday_count(base, datas) // BLOCO_DIAS_UTEIS
-    out = df.copy()
-    out["bloco"] = blocos.astype(int)
-    return out
-
-
-def bootstrap_ic_bloco(
-    df: pd.DataFrame, col_score: str, col_y: str,
-    n_iter: int = N_BOOTSTRAP, seed: int = SEED_BOOTSTRAP,
-) -> dict:
-    """IC de Spearman com IC95 via block bootstrap POR DATA. Reamostra blocos (de
-    5 dias úteis) com reposição `n_iter` vezes; percentis 2.5/97.5. Determinístico
-    dada a seed. Requer coluna 'bloco'."""
-    s = df[col_score].to_numpy(dtype="float64")
-    y = df[col_y].to_numpy(dtype="float64")
-    blocos = df["bloco"].to_numpy()
-    unicos = np.unique(blocos)
-    grupos = [np.where(blocos == b)[0] for b in unicos]
-    n_b = len(unicos)
-    ic_pt = calcular_ic(s, y)
-    rng = np.random.default_rng(seed)
-    amostras = []
-    for _ in range(n_iter):
-        pick = rng.integers(0, n_b, n_b)
-        idx = np.concatenate([grupos[p] for p in pick])
-        v = calcular_ic(s[idx], y[idx])
-        if v == v:  # descarta NaN (reamostra degenerada)
-            amostras.append(v)
-    amostras = np.array(amostras) if amostras else np.array([ic_pt])
-    return {
-        "ic": float(ic_pt),
-        "ic95_low": float(np.percentile(amostras, 2.5)),
-        "ic95_high": float(np.percentile(amostras, 97.5)),
-        "n": int(len(df)),
-        "n_blocos": int(n_b),
-    }
 
 
 def bootstrap_delta_ic_pareado(
@@ -185,49 +138,7 @@ def eh_fallback(score) -> bool:
     return (not score.tem_evento) or (score.confianca < 0.3) or bool(score.avisos)
 
 
-# ── Instrumentação do SDK (não toca agents/econ.py) ───────────────────────────
-
-_CALLS: list[dict] = []  # {"latencia_s", "input_tokens", "output_tokens"} por create
-
-
-def _instalar_captura() -> None:
-    """Envolve `Messages.create` para cronometrar SÓ a chamada ao LLM e capturar
-    usage. Idempotente."""
-    import anthropic.resources.messages as _m
-
-    if getattr(_m.Messages.create, "_gate_wrapped", False):
-        return
-    _orig = _m.Messages.create
-
-    def _wrap(self, *a, **k):
-        t0 = time.perf_counter()
-        resp = _orig(self, *a, **k)
-        dt = time.perf_counter() - t0
-        u = getattr(resp, "usage", None)
-        _CALLS.append({
-            "latencia_s": dt,
-            "input_tokens": getattr(u, "input_tokens", None) if u else None,
-            "output_tokens": getattr(u, "output_tokens", None) if u else None,
-        })
-        return resp
-
-    _wrap._gate_wrapped = True
-    _m.Messages.create = _wrap
-
-
 # ── Etapa A — amostragem de eventos limpos ────────────────────────────────────
-
-
-def _calendario_pregoes(inicio: pd.Timestamp, fim: pd.Timestamp) -> list[pd.Timestamp]:
-    """Pregões B3 (BMF) na janela, tz-aware SP às 23:59 (captura o dia inteiro de
-    notícia; entrada no fechamento do dia)."""
-    import pandas_market_calendars as mcal
-
-    bmf = mcal.get_calendar("BMF")
-    sched = bmf.schedule(start_date=inicio.date(), end_date=fim.date())
-    naive = sched.index.tz_localize(None)
-    return [pd.Timestamp(d.date(), tz=FUSO) + pd.Timedelta(hours=23, minutes=59)
-            for d in naive]
 
 
 def amostrar_eventos(
@@ -295,64 +206,6 @@ def amostrar_eventos(
 
 
 # ── Etapas B/C — avaliar cada evento com cada modelo ──────────────────────────
-
-
-class _Checkpoint:
-    """Checkpoint incremental (long format) para retomar sem re-avaliar.
-
-    Grava em INTERMEDIARIO_CSV a cada CHECKPOINT_A_CADA avaliações (modo append).
-    Na retomada, pares (modelo, evento_id) já presentes são pulados. O EconAgent
-    também tem cache próprio, mas o checkpoint evita reconstruir contexto e
-    sobrevive a um crash no meio do gate pago."""
-
-    COLS = ["evento_id", "ticker", "data", "y_realizado", "modelo", "score",
-            "latencia_llm_s", "tokens_in", "tokens_out", "custo_usd"]
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.feitos: dict[tuple[str, int], dict] = {}
-        self._buffer: list[dict] = []
-        if path.exists():
-            prev = pd.read_csv(path)
-            for _, r in prev.iterrows():
-                self.feitos[(str(r["modelo"]), int(r["evento_id"]))] = r.to_dict()
-            logger.info("Checkpoint: %d avaliações carregadas de %s (retomada)",
-                        len(self.feitos), path.name)
-
-    def ja_feito(self, modelo: str, evento_id: int) -> bool:
-        return (modelo, int(evento_id)) in self.feitos
-
-    def linha_feita(self, modelo: str, evento_id: int) -> dict:
-        return self.feitos[(modelo, int(evento_id))]
-
-    def registrar(self, row: dict) -> None:
-        self.feitos[(row["modelo"], int(row["evento_id"]))] = row
-        self._buffer.append({k: row[k] for k in self.COLS})
-        if len(self._buffer) >= CHECKPOINT_A_CADA:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self._buffer:
-            return
-        escrever_header = not self.path.exists()
-        pd.DataFrame(self._buffer, columns=self.COLS).to_csv(
-            self.path, mode="a", header=escrever_header, index=False)
-        self._buffer = []
-
-
-def _avaliar_com_retry(agent, ev, max_tentativas: int = MAX_RETRY_AVALIAR):
-    """avaliar com backoff exponencial (2s, 4s). Levanta a última exceção se
-    todas as tentativas falharem — o caller então pula o evento (grac.)."""
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            return agent.avaliar(ev["ticker"], ev["data"], noticias_override=ev["noticias"])
-        except Exception as e:
-            if tentativa >= max_tentativas:
-                raise
-            espera = 2 ** tentativa
-            logger.warning("avaliar %s %s tentativa %d/%d falhou (%s); retry em %ds",
-                           ev["ticker"], ev["data"].date(), tentativa, max_tentativas, e, espera)
-            time.sleep(espera)
 
 
 def _linha_de_checkpoint(ev: dict, modelo: str, prev: dict) -> dict:
@@ -555,11 +408,13 @@ def gerar_relatorio(df_merged: pd.DataFrame, diag: dict, res_h: dict, res_s: dic
                   "recente, ago-dez/2025 pode estar (parcialmente) no treino do Sonnet "
                   "→ risco de contaminação diferencial (Sonnet 'lembrar' de eventos que "
                   "o Haiku não viu). Não há como corrigir dentro do gate.")
-    linhas.append("- **Divergência metodológica com `econ_calibration.py::comparar_"
-                  "modelos()`**: lá o bootstrap é i.i.d. (reamostra linhas); aqui é "
-                  "block-by-date (blocos de 5 dias úteis). Motivo: retornos por data são "
-                  "correlacionados, então i.i.d. subestima o IC95. O ΔIC deste gate usa "
-                  "bootstrap PAREADO (mesmos blocos p/ os dois modelos).")
+    linhas.append("- **Bootstrap block-by-date** (blocos de 5 dias úteis), não i.i.d.: "
+                  "retornos por data são correlacionados, então reamostrar linhas "
+                  "subestima o IC95. O ΔIC deste gate usa bootstrap PAREADO (mesmos "
+                  "blocos p/ os dois modelos). A divergência com "
+                  "`econ_calibration.py::comparar_modelos()` (que usava i.i.d.) foi "
+                  "reconciliada: o block bootstrap agora é canônico em "
+                  "`econ_calibration.py` e o gate importa de lá.")
     linhas.append("- Sem iteração de prompt, sem placebo, sem auditoria de "
                   "justificativas (fora do escopo deste gate — é decisão única).")
     linhas.append("- Target usa Close AJUSTADO (via `_retorno_excesso_5d`), enquanto "

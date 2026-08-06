@@ -47,6 +47,8 @@ RESUMO_*.md
 !calibration/results/RELATORIO_CALIBRACAO_MATHML.md
 # Exceção: relatório oficial do gate de custo Haiku vs Sonnet é entregável versionado
 !calibration/results/RELATORIO_GATE_CUSTO.md
+# Exceção: relatório oficial da calibração do ECON é entregável versionado
+!calibration/results/RELATORIO_CALIBRACAO_ECON.md
 
 # Saídas transitórias de debug
 *.log

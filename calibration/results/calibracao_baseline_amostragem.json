@@ -1,0 +1,11 @@
+{
+  "n_eventos": 636,
+  "n_limpos": 281,
+  "n_candidatos": 11632,
+  "n_sem_noticia": 9578,
+  "n_duplicados_descartados": 1289,
+  "n_sem_y": 129,
+  "dedup": true,
+  "n_max": 0,
+  "cutoff_limpo": "2025-08-01 00:00:00-03:00"
+}
