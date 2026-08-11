@@ -14,6 +14,7 @@ import pytest
 from config import FUSO
 from agents.journal import Fundamentals
 from agents.sources.noticia import Noticia
+from agents.sources.bloomberg_earnings import EarningsBloomberg
 from agents import econ as econ_mod
 from agents.econ import EconAgent, ScoreEcon
 
@@ -407,3 +408,199 @@ def test_noticias_hashes_vazio_sem_evento(tmp_path):
     score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
 
     assert score.noticias_hashes == []
+
+
+# ── Earnings Bloomberg no dossiê (Subetapa B) ─────────────────────────────────
+#
+# O bloco de CONTEXTO DE RESULTADO TRIMESTRAL entra só quando a notícia cai a
+# ≤5 dias úteis DEPOIS de uma divulgação de resultado. Sem consenso no dossiê o
+# Haiku infere a expectativa de memória — contaminação medida na Etapa 2.
+
+
+def _earnings(
+    ticker="PETR4.SA",
+    data_divulgacao="2024-03-14",
+    periodo="Q4 23",
+    lpa_estimado=1.871,
+    lpa_realizado=2.154,
+    lpa_comparavel=2.070,
+    surpresa_pct=10.64,
+    var_preco_pct=-6.15,
+) -> EarningsBloomberg:
+    return EarningsBloomberg(
+        ticker=ticker,
+        data_divulgacao=ts(data_divulgacao),
+        periodo=periodo,
+        periodo_ref=ts("2023-12-31"),
+        lpa_estimado=lpa_estimado,
+        lpa_realizado=lpa_realizado,
+        lpa_comparavel=lpa_comparavel,
+        surpresa_pct=surpresa_pct,
+        var_preco_pct=var_preco_pct,
+        pl=3.8,
+    )
+
+
+class _EarningsFake:
+    """Fonte de earnings em memória, com o mesmo corte anti-lookahead da real."""
+
+    def __init__(self, earnings: list[EarningsBloomberg]):
+        self._earnings = sorted(earnings, key=lambda e: e.data_divulgacao)
+
+    def buscar_earnings_proximos(self, ticker, data_limite, janela_dias=5):
+        import numpy as np
+        elegiveis = [
+            e for e in self._earnings
+            if e.ticker == ticker
+            and e.data_divulgacao <= data_limite
+            and np.busday_count(e.data_divulgacao.date(), data_limite.date()) <= janela_dias
+        ]
+        return elegiveis[-1] if elegiveis else None
+
+
+def _agent_com_earnings(tmp_path, earnings: list[EarningsBloomberg], noticias=None):
+    return EconAgent(
+        journal=_journal_mock(noticias if noticias is not None else [_noticia()]),
+        client=_client_mock(_TOOL_OK),
+        cache_dir=tmp_path,
+        earnings_source=_EarningsFake(earnings),
+    )
+
+
+def test_dossie_inclui_earnings_quando_proximo_de_resultado(tmp_path):
+    # Resultado em 14/03 (qui); avaliação em 15/03 → 1 dia útil depois.
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-14")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL:" in contexto
+    assert "Q4 23" in contexto
+
+
+def test_dossie_sem_earnings_quando_longe_de_resultado(tmp_path):
+    # Resultado em 01/02; avaliação em 15/03 → ~30 dias úteis, fora da janela.
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-02-01")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" not in contexto
+
+
+def test_dossie_sem_earnings_quando_source_none(tmp_path):
+    # Backwards-compatible: sem fonte injetada o dossiê é o de antes.
+    agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path)
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" not in contexto
+
+
+def test_earnings_no_dossie_respeita_anti_lookahead(tmp_path):
+    # Resultado sai em 20/03, avaliação em 15/03: não pode vazar para o dossiê.
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-20")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" not in contexto
+    assert "Q4 23" not in contexto
+
+
+def test_formato_do_bloco_earnings_no_dossie(tmp_path):
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-14")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert contexto.endswith(
+        "CONTEXTO DE RESULTADO TRIMESTRAL:\n"
+        "Período: Q4 23 | Divulgado em: 2024-03-14\n"
+        "- LPA realizado (GAAP): R$ 2.154\n"
+        "- LPA comparável (ajustado): R$ 2.070\n"
+        "- Estimativa consenso: R$ 1.871\n"
+        "- Surpresa vs consenso: +10.64% (calculada sobre comparável)\n"
+        "- Reação do preço na sessão de divulgação: -6.15%"
+    )
+
+
+def test_bloco_omite_reacao_do_preco_no_proprio_dia_da_divulgacao(tmp_path):
+    # `Var prç%` do Terminal é a SESSÃO DE REAÇÃO, que em 18 de 21 amostras é
+    # D+1 (resultado sai after-market). Avaliando em D, essa sessão ainda não
+    # aconteceu — e pior, ela é a primeira perna do alvo y (D→D+5). Mostrá-la
+    # seria lookahead estrutural.
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-15")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 23:59"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" in contexto  # consenso/LPA seguem
+    assert "Reação do preço" not in contexto
+    assert "-6.15" not in contexto
+
+
+def test_bloco_inclui_reacao_do_preco_a_partir_do_dia_util_seguinte(tmp_path):
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-14")])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 23:59"), [_noticia()], [])
+
+    assert "- Reação do preço na sessão de divulgação: -6.15%" in contexto
+
+
+def test_bloco_omite_linha_de_lpa_ausente(tmp_path):
+    # Sem comparável: a linha some, não vira "R$ None".
+    agent = _agent_com_earnings(tmp_path, [_earnings(lpa_comparavel=None)])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "None" not in contexto
+    assert "LPA comparável" not in contexto
+    assert "- LPA realizado (GAAP): R$ 2.154" in contexto
+
+
+def test_sem_bloco_quando_realizado_e_comparavel_ausentes(tmp_path):
+    # Só consenso (linha de calendário futuro) não é resultado divulgado.
+    agent = _agent_com_earnings(
+        tmp_path, [_earnings(lpa_realizado=None, lpa_comparavel=None, surpresa_pct=None)])
+
+    contexto = agent._montar_contexto("PETR4.SA", ts("2024-03-15 17:00"), [_noticia()], [])
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" not in contexto
+
+
+def test_identidade_pura_nao_recebe_earnings(tmp_path):
+    # O placebo esconde a identidade da empresa; período e LPAs a entregariam.
+    agent = _agent_com_earnings(tmp_path, [_earnings(data_divulgacao="2024-03-14")])
+
+    contexto = agent._montar_contexto(
+        "PETR4.SA", ts("2024-03-15 17:00"), [_noticia(titulo="Empresa anuncia plano")], [],
+        nome_override="a companhia", incluir_contexto_fundamental=False)
+
+    assert "CONTEXTO DE RESULTADO TRIMESTRAL" not in contexto
+    assert "Q4 23" not in contexto
+
+
+def test_cache_separa_avaliacao_com_e_sem_earnings(tmp_path):
+    # Mesmo ticker/data/notícia, dossiês diferentes: o cache NÃO pode servir a
+    # avaliação sem earnings para a chamada com earnings (degradação silenciosa).
+    noticias = [_noticia()]
+    sem = EconAgent(journal=_journal_mock(noticias), client=_client_mock(_TOOL_OK),
+                    cache_dir=tmp_path)
+    sem.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    client_com = _client_mock(_TOOL_OK)
+    com = EconAgent(journal=_journal_mock(noticias), client=client_com, cache_dir=tmp_path,
+                    earnings_source=_EarningsFake([_earnings(data_divulgacao="2024-03-14")]))
+    com.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    client_com.messages.create.assert_called_once()
+
+
+def test_falha_da_fonte_de_earnings_nao_derruba_avaliacao(tmp_path):
+    # Degradação graciosa: o backtest não pode quebrar por uma fonte de dados.
+    fonte_quebrada = MagicMock()
+    fonte_quebrada.buscar_earnings_proximos.side_effect = RuntimeError("excel corrompido")
+    agent = EconAgent(journal=_journal_mock([_noticia()]), client=_client_mock(_TOOL_OK),
+                      cache_dir=tmp_path, earnings_source=fonte_quebrada)
+
+    score = agent.avaliar("PETR4.SA", ts("2024-03-15 17:00"))
+
+    assert score.score_total == 0.6
+    assert any("earnings" in a.lower() for a in score.avisos)

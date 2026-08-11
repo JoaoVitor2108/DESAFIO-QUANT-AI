@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -32,6 +33,7 @@ load_dotenv()
 
 from config import FUSO, TICKER_PARA_NOME, UNIVERSO_HISTORICO
 from agents.journal import JournalAgent, _DiskCache, _validate_aware
+from agents.sources.bloomberg_earnings import EarningsBloomberg
 from agents.sources.noticia import Noticia
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,10 @@ _MAX_CONTEUDO_CHARS = 800
 # 0.25 num range [-1,+1] = tolera 1/8 da escala (0.5 tolerava metade — frouxo).
 # TODO(calibração): medir abs(score_total - comp_noticia) típico e recalibrar.
 _DIVERGENCIA_MAX = 0.25
+
+# Janela de dias úteis entre a divulgação do resultado e a data avaliada para
+# que o earnings entre no dossiê. 5du = horizonte do target do JEMPO.
+_JANELA_EARNINGS_DIAS = 5
 
 
 # ── Contrato de saída ─────────────────────────────────────────────────────────
@@ -198,6 +204,63 @@ def _neutro(ticker, data_limite, n_noticias, justificativa, avisos, modelo,
     )
 
 
+def _id_earnings(e: Optional[EarningsBloomberg]) -> str:
+    """Identidade do earnings para a chave de cache. Ausente → string vazia."""
+    return "" if e is None else f"{e.ticker}|{e.periodo}|{e.data_divulgacao.date()}"
+
+
+def formatar_bloco_earnings(
+    e: EarningsBloomberg, data_limite: pd.Timestamp
+) -> Optional[str]:
+    """Earnings do Bloomberg → bloco de texto do dossiê. None se não há resultado.
+
+    Mostra os DOIS LPAs rotulados: o Terminal calcula `%Surp` sobre o LPA
+    comparável (ajustado), não sobre o GAAP divulgado. Sem os dois lado a lado o
+    dossiê afirmaria uma surpresa que não fecha com os números — LREN3 Q3 25
+    divulgou −0,032 contra consenso de 0,249 e ainda assim BATEU o consenso
+    (comparável 0,28, surpresa +12,57%).
+
+    ANTI-LOOKAHEAD da reação do preço: `Var prç%` é a variação da SESSÃO DE
+    REAÇÃO ao resultado, que em 18 de 21 amostras conferidas contra o yfinance é
+    D+1 (resultado brasileiro sai after-market), e não D. Avaliando no próprio
+    dia da divulgação essa sessão ainda não ocorreu — e ela é a PRIMEIRA PERNA do
+    alvo (`y` vai de D a D+5), então exibi-la vazaria o alvo direto no dossiê.
+    Medido: IC dessa linha é +0,68 nos eventos de D (sobreposição aritmética) e
+    −0,07 a partir de D+1 (sinal real ≈ zero). Por isso a linha só entra quando
+    já passou ao menos 1 dia útil da divulgação; consenso e LPAs, esses já são
+    públicos no dia e seguem sempre.
+
+    Linhas com valor ausente são omitidas em vez de imprimir "None". Sem nenhum
+    LPA realizado nem comparável não houve divulgação: retorna None.
+    """
+    if e.lpa_realizado is None and e.lpa_comparavel is None:
+        return None
+
+    linhas = [
+        "CONTEXTO DE RESULTADO TRIMESTRAL:",
+        f"Período: {e.periodo} | Divulgado em: {e.data_divulgacao.date()}",
+    ]
+    if e.lpa_realizado is not None:
+        linhas.append(f"- LPA realizado (GAAP): R$ {e.lpa_realizado:.3f}")
+    if e.lpa_comparavel is not None:
+        linhas.append(f"- LPA comparável (ajustado): R$ {e.lpa_comparavel:.3f}")
+    if e.lpa_estimado is not None:
+        linhas.append(f"- Estimativa consenso: R$ {e.lpa_estimado:.3f}")
+    if e.surpresa_pct is not None:
+        linhas.append(
+            f"- Surpresa vs consenso: {e.surpresa_pct:+.2f}% (calculada sobre comparável)"
+        )
+    sessao_de_reacao_ja_ocorreu = (
+        np.busday_count(e.data_divulgacao.date(), data_limite.date()) >= 1
+    )
+    if e.var_preco_pct is not None and sessao_de_reacao_ja_ocorreu:
+        linhas.append(
+            f"- Reação do preço na sessão de divulgação: {e.var_preco_pct:+.2f}%"
+        )
+
+    return "\n".join(linhas)
+
+
 # ── EconAgent ─────────────────────────────────────────────────────────────────
 
 
@@ -208,12 +271,19 @@ class EconAgent:
         client=None,
         model: str = MODELO_PADRAO,
         cache_dir: Path = Path("data/cache"),
+        earnings_source=None,
     ) -> None:
+        """`earnings_source`: fonte de consenso do Bloomberg (opcional).
+
+        Ausente → o dossiê sai sem o bloco de resultado trimestral, exatamente
+        como antes da Subetapa B (backwards-compatible).
+        """
         self.journal = journal if journal is not None else JournalAgent(cache_dir=cache_dir)
         self.model = model
         self._client = client          # injeção de dependência (testes); None → lazy
         self._client_resolvido = client is not None
         self._cache = _DiskCache(cache_dir)
+        self._earnings_source = earnings_source
 
     # ── Cliente Anthropic (lazy) ──────────────────────────────────────────────
 
@@ -278,6 +348,9 @@ class EconAgent:
         # 3. Cache por (ticker, data, modelo, versão do prompt, contexto, notícias).
         # nome_override e o flag de contexto entram na chave: placebo (qualquer modo)
         # e avaliação real não compartilham cache.
+        # O bloco de earnings muda o dossiê sem mudar o prompt: sua identidade
+        # precisa entrar na chave, senão uma avaliação cacheada ANTES da
+        # Subetapa B seria servida como se tivesse visto o consenso.
         cache_key = {
             "t": ticker,
             "dl": str(data_limite.date()),
@@ -287,6 +360,12 @@ class EconAgent:
             "ctx": int(incluir_contexto_fundamental),
             "h": _hash_noticias(noticias),
         }
+        earnings_da_chave = self._buscar_earnings(ticker, data_limite)
+        if earnings_da_chave is not None:
+            # Só entra quando HÁ earnings: assim as avaliações sem resultado
+            # trimestral mantêm a chave anterior à Subetapa B e o cache do
+            # baseline continua válido (re-rodar não paga API de novo).
+            cache_key["ern"] = _id_earnings(earnings_da_chave)
         cached = self._cache.get("econ_avaliar", cache_key)
         if cached is not None:
             return cached
@@ -341,6 +420,28 @@ class EconAgent:
         return score
 
     # ── Internos ──────────────────────────────────────────────────────────────
+
+    def _buscar_earnings(
+        self, ticker, data_limite, avisos: Optional[list[str]] = None
+    ) -> Optional[EarningsBloomberg]:
+        """Resultado trimestral divulgado a ≤5du de `data_limite`, ou None.
+
+        Degradação graciosa (princípio do JOURNAL): falha da fonte vira aviso e
+        dossiê sem earnings, nunca exceção — o backtest não pode quebrar por uma
+        fonte de dados. `avisos=None` silencia o registro, para a consulta que
+        só monta a chave de cache não duplicar o aviso.
+        """
+        if self._earnings_source is None:
+            return None
+        try:
+            return self._earnings_source.buscar_earnings_proximos(
+                ticker, data_limite, janela_dias=_JANELA_EARNINGS_DIAS
+            )
+        except Exception as e:
+            logger.warning("Fonte de earnings falhou para %s: %s", ticker, e)
+            if avisos is not None:
+                avisos.append(f"earnings indisponíveis: {e}")
+            return None
 
     def _montar_contexto(self, ticker, data_limite, noticias, avisos: list[str],
                          nome_override: Optional[str] = None,
@@ -421,11 +522,24 @@ class EconAgent:
         except Exception as e:
             avisos.append(f"retornos do setor indisponíveis: {e}")
 
-        return (
+        dossie = (
             "Avalie a ação com base nos dados abaixo (todos ex-ante à data_limite). "
             "Responda chamando a ferramenta registrar_avaliacao.\n\n"
             + json.dumps(payload, ensure_ascii=False, default=str, indent=2)
         )
+
+        # Consenso de earnings, quando a notícia cai logo após uma divulgação.
+        # Fora do JSON de propósito: é um bloco em linguagem natural, formato
+        # que o LLM lê melhor que um objeto aninhado a mais.
+        # Não entra no caminho `identidade_pura` (early return acima): o período
+        # e os LPAs entregariam a empresa que o placebo quer ocultar.
+        earnings = self._buscar_earnings(ticker, data_limite, avisos)
+        if earnings is not None:
+            bloco = formatar_bloco_earnings(earnings, data_limite)
+            if bloco:
+                dossie += "\n\n" + bloco
+
+        return dossie
 
     def _parsear(self, ticker, data_limite, noticias, resposta, avisos: list[str]) -> Optional[ScoreEcon]:
         """Extrai o bloco tool_use e monta o ScoreEcon; None se a resposta for inválida.

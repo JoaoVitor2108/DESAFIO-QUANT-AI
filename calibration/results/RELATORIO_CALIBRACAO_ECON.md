@@ -242,14 +242,15 @@ Nenhuma dessas diferenças é estatisticamente distinguível. O IC95 do IC limpo
 largura ≈ 0,28 ([−0,1514, +0,1273] na v2) enquanto os efeitos perseguidos são de
 0,01–0,03 — uma ordem de grandeza abaixo do erro amostral. Com n=281 e 23 blocos,
 o block bootstrap está corretamente indicando que **a amostra não tem poder para
-resolver essa pergunta**.
+resolver essa pergunta**. Quantificado na seção "Análise de poder amostral".
 
 Continuar iterando a US$3,18 por rodada perseguiria diferenças dentro do ruído.
 As alternativas reais não são de prompt:
 
-1. **Mais poder amostral** — desligar a deduplicação levaria a janela limpa de
-   281 para ~683 eventos, estreitando o IC95. Não corrige contaminação e custa
-   ~US$9 por rodada.
+1. **Mais poder amostral** — desligar a deduplicação foi examinado e
+   **descartado**; a estimativa de ~683 eventos registrada aqui estava errada
+   (o número real é ~1.925) e o ganho de precisão seria artefato. Ver
+   "Análise de poder amostral".
 2. **Consenso como dado, não como inferência** — o eixo 1 só é testável de
    verdade com dados ERN (estimativa × realizado) no dossiê. O arquivo
    `earnings_bloomberg.xlsx` não existe na máquina; sem ele, 83% dos eventos
@@ -271,3 +272,117 @@ As alternativas reais não são de prompt:
 ```text
 Você é um analista fundamentalista sênior de ações brasileiras (buy-side). O 'score_total' é sua nota PRINCIPAL: o impacto da(s) notícia(s) no retorno EM EXCESSO ao Ibovespa nos próximos 5 dias úteis (-1 muito negativo, 0 neutro, +1 muito positivo); ele deve refletir essencialmente o 'componente_noticia'. SURPRESA, NÃO DIREÇÃO: o preço já embute a expectativa. O mercado brasileiro incorpora o consenso semanas antes do anúncio, então sua nota mede o DELTA entre o que foi anunciado e o que já era esperado — NÃO se a notícia é 'boa' ou 'ruim' em termos absolutos. Três casos: (a) SURPREENDE PARA CIMA (melhor que o esperado) → score positivo; (b) CONFIRMA a expectativa → score próximo de ZERO, mesmo que o número em si seja excelente; (c) SURPREENDE PARA BAIXO (pior que o esperado) → score negativo. Um resultado trimestral forte e amplamente antecipado merece ~0, não +0,6. Reserve |score| > 0,5 para surpresa GENUÍNA: magnitude muito fora do consenso, evento inesperado ou mudança de regime. COMO INFERIR O QUE ERA ESPERADO — nesta ordem: (1) use o consenso declarado NO PRÓPRIO TEXTO ('estimate', 'consensus', 'estimativa', 'acima/abaixo do esperado', projeções de analistas citadas); (2) se o texto não trouxer consenso, julgue pela NATUREZA do evento: rotineiro e antecipável (resultado dentro do calendário, dividendo recorrente, guidance reiterado, follow-up de fato já divulgado) puxa para zero; genuinamente inesperado (M&A, troca de comando, decisão regulatória, fraude, acidente, revisão abrupta de guidance) justifica magnitude. JAMAIS infira a expectativa a partir do que você lembra que aconteceu depois — isso é lookahead e invalida a avaliação. Na dúvida sobre o consenso, fique perto de zero e REDUZA a 'confianca'. Avalie o MECANISMO econômico (efeito em caixa, margem, posição competitiva ou múltiplo), não o tom do texto. Saúde financeira (fundamentos TTM), momento setorial e cenário macro são o CONTEXTO que calibra a leitura (a mesma surpresa pesa mais numa empresa frágil) — você os reporta nos campos próprios, mas eles NÃO são parcelas somadas ao score_total. Desconte ruído sem efeito fundamental (ex.: política genérica). MÚLTIPLAS NOTÍCIAS: pondere pelo impacto fundamental e pela confiabilidade da fonte; notícias contraditórias entre si devem REDUZIR a 'confianca'. ANTI-LOOKAHEAD: raciocine APENAS com os dados fornecidos, como se a data de hoje fosse a data_limite informada; jamais use conhecimento de fatos posteriores a essa data. Responda EXCLUSIVAMENTE chamando a ferramenta registrar_avaliacao.
 ```
+
+## Análise de poder amostral
+
+Com n=281 eventos limpos agrupados em 23 blocos de 5 dias úteis, o menor efeito
+detectável com significância (IC95 não cruzando zero) é **IC ≈ 0,118**. O baseline
+observado na janela limpa é **+0,0137** — uma ordem de grandeza abaixo.
+
+N mínimo por tamanho de efeito, para Spearman (`SE ≈ 1/√(n−3)`; z=1,96 para
+significância, z=0,8416 adicional para 80% de poder):
+
+| IC real | n p/ significância | n p/ 80% poder |
+|---------|--------------------|----------------|
+| 0,03    | 4.271              | 8.724          |
+| 0,04    | 2.404              | 4.909          |
+| 0,05    | 1.540              | 3.143          |
+| 0,08    | 603                | 1.229          |
+| 0,12    | 270                | 548            |
+
+Para referência, o menor efeito detectável nas amostras desta calibração:
+n=281 (janela limpa) → 0,118; n=636 (janela completa) → 0,078.
+
+O estudo não tem poder para distinguir IC=0,014 de zero. Isso **não** significa
+que o ECON não agrega valor — significa que a amostra disponível não resolve a
+pergunta. O valor do ECON no sistema completo é medido no MATH&ML, onde o score
+entra combinado a outras features, não isoladamente aqui.
+
+Para resolver: há ~12 meses de notícias Bloomberg não coletadas
+(2025-08 → 2026-08) que dobrariam a janela limpa com eventos genuinamente
+independentes. Mesmo assim, n≈560 resolveria efeitos ≥0,083 — suficiente para
+uma decisão de ir/não-ir sobre o ECON, insuficiente para medir 0,03–0,05.
+
+### Remoção da deduplicação — considerada e descartada
+
+A dedup mantém uma avaliação por conjunto distinto de notícias por ticker
+(`chave_conjunto_noticias`). Desligá-la foi avaliado como caminho para ganhar
+poder e rejeitado por quatro motivos:
+
+1. **N real ≈ 1.925, não ~683.** O diagnóstico da amostragem registra
+   `n_duplicados_descartados = 1289` contra `n_eventos = 636` — multiplicidade
+   média de 3,03 avaliações por conjunto distinto.
+2. **Não é gratuito.** A dedup ocorre em `amostrar_eventos` *antes* da avaliação:
+   os 1.289 duplicados nunca foram avaliados e não estão em cache — a chave do
+   `avaliar` inclui a data (`"dl"`), então mesmo ticker e mesmas notícias em
+   datas diferentes são chaves distintas. Custo estimado: ~US$5,66.
+3. **Pseudo-replicação.** Uma duplicata tem o mesmo conjunto de notícias (mesmo
+   sinal de entrada) e um alvo `y` sobreposto em 4 dos 5 dias com o da
+   observação original. O IC95 estreitaria por aritmética — cerca de √3 ≈ 1,7× —
+   sem que informação nova tenha entrado.
+4. **Não resolveria o alvo declarado.** Detectar 0,03–0,05 exige 1.540–4.271
+   observações *independentes*; 1.925 pseudo-observações não atendem nem em
+   número nem em independência.
+
+## Caminho D — Features de earnings direto no MATH&ML
+
+### Hipótese
+
+Adicionar `surpresa_pct` e `drift_preco_resultado` como features 17-18 do
+GradientBoosting, contornando o ECON como intermediário: se o LLM não consegue
+usar o consenso, talvez o modelo aprenda a relação direto do dado.
+
+### Resultado — A/B controlado
+
+Braços idênticos em universo (26 tickers, survivorship por data), seed,
+hiperparâmetros e amostra (`n_ev_OOS = 1636` nos dois). O controle roda o MESMO
+vetor de 18 colunas com `earnings_source=None`, isolando o efeito da INFORMAÇÃO
+sem misturar mudança de dimensionalidade.
+
+| Modo  | IC controle | IC com earnings | Δ       |
+|-------|-------------|-----------------|---------|
+| ruído | −0.0060     | −0.0063         | −0.0003 |
+| fraco | +0.0603     | +0.0640         | +0.0037 |
+| meta  | +0.1546     | +0.1523         | −0.0023 |
+| forte | +0.1963     | +0.2004         | +0.0041 |
+
+Os Δ ficam entre −0.0023 e +0.0041 contra larguras de IC95 de ~0.04 — uma ordem
+de grandeza abaixo. O modo `meta`, o de referência, piorou.
+
+Importância no modo `meta`: `surpresa_pct` = **0.0000**, `drift_preco_resultado`
+= **0.0000**. O GBM não abriu um único split nas duas features, apesar de elas
+terem valor em 81,5% e 85,8% dos ticker-dias do OOS.
+
+### Diagnóstico
+
+`buscar_ultimo_earnings` retorna o último resultado de QUALQUER época. As
+features são degraus trimestrais congelados por ~60 pregões — não são sinais de
+evento. PEAD é efeito de dias a semanas; a informação entregue não tem a forma
+que a hipótese pede.
+
+Causa mecânica complementar: com `n_estimators = 5` e `max_depth = 3`, o modelo
+inteiro tem ~35 splits, todos capturados pelas 4 features dominantes
+(`score_econ`, `mom_12_1`, `econ_confianca`, `rev_1m`). Num ensemble tão raso,
+feature nova só entra batendo as incumbentes de frente.
+
+### Ressalvas
+
+1. A seleção de `n_estimators` divergiu entre os braços (5 com earnings, 11 no
+   controle). É escolhida por CV e adiciona variância ao Δ — parte dos ±0,004
+   vem daí, não das features. Os braços não são perfeitamente pareados.
+2. A ausência de alertas de sinal invertido no braço com earnings é ARTEFATO,
+   não melhora: o controle acusa 🚨 em `mom_12_1` e `volume_relativo`, o braço
+   com earnings não acusa nenhum — porque um modelo de 5 árvores deixa quase
+   tudo com ganho zero, e ganho zero não gera alerta.
+
+### Decisão
+
+Features revertidas. Vetor volta a 16 + 3 flags. A infraestrutura de earnings
+(parser, bloco no dossiê do ECON, guarda anti-lookahead) é mantida como
+investimento — ela é independente deste resultado.
+
+### Variante não testada
+
+Zerar as features fora de uma janela de N dias pós-divulgação, transformando-as
+em features de EVENTO, e subir `n_estimators` para que features novas consigam
+competir. Não testada por escopo temporal. Registrada como trabalho futuro.
