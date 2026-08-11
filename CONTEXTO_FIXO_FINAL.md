@@ -1392,6 +1392,48 @@ abertamente no relatório final.
   em que o ECON lê a direção fundamental CORRETA e o mercado já
   precificou (LREN3 recorrente). Eixo #1 da Etapa 2.
 
+### Etapa 2 (prompt engineering) — ENCERRADA após 1 iteração
+- **Versão final do prompt: `2026-06-econA` (o baseline).** A v2 foi
+  revertida no código e permanece documentada no relatório, com texto
+  integral no anexo.
+- **Eixo testado:** surpresa vs consenso (v2 = `2026-08-econB`). O prompt
+  foi obedecido — score médio +0,1051 → +0,0385, extremos |s|>0,5 de
+  27,0% → 17,6%, quase-neutros |s|≤0,1 de 5,8% → 16,5%, 54,1% dos
+  eventos mudaram de nota.
+- **Resultado:** IC limpo caiu de +0,0137 para +0,0015 (ΔIC = −0,0122);
+  IC completo subiu de +0,0581 para +0,0758.
+- **Motivo do encerramento — assinatura de memória, não de raciocínio:**
+  | Janela | n | IC v1 | IC v2 |
+  |---|---|---|---|
+  | contaminada (< 2025-08) | 355 | +0,0764 | +0,1032 |
+  | LIMPA (≥ 2025-08) | 281 | +0,0137 | +0,0015 |
+  Melhorou só onde o modelo pode ter visto o desfecho no treino. É o
+  critério de overfit que `calibrar()` já documentava.
+- **Causa raiz:** só 17% das notícias trazem consenso explícito no corpo
+  Bloomberg. Nos outros 83%, perguntar "isso surpreendeu?" sem dar o
+  consenso convida resposta de memória.
+- **LREN3 tracker:** continua 4/10 nos piores casos (IC isolado −0,3034
+  → −0,2744). O eixo não resolveu o caso emblemático.
+- **Limitação que encerra a etapa:** IC95 do IC limpo tem largura ≈0,28
+  para efeitos perseguidos de 0,01–0,03. Com n=281 e 23 blocos a amostra
+  NÃO tem poder para a pergunta. Iterar mais perseguiria ruído.
+- **`earnings_bloomberg.xlsx` NÃO EXISTE** na máquina (busca no projeto e
+  na home). Sem dados ERN, o eixo 1 não é testável de verdade.
+- **Custos:** Etapa 1 US$ 2,7937 + Etapa 2 US$ 3,1841 = **US$ 5,9778**.
+  Sobraram US$ 11,82 do cap de US$ 15 da Etapa 2.
+
+### Infra de iteração de prompt (`calibration/etapa2_prompt.py`)
+- Resume cada versão na mesma régua, monta tabela comparativa, aplica os
+  critérios de parada e mantém o relatório multi-versão (idempotente por
+  marca HTML `<!-- etapa2:VERSAO -->`).
+- **Armadilha corrigida:** a chave do checkpoint é (modelo, evento_id) —
+  SEM versão de prompt. Rodar a iteração N reusaria o checkpoint da N-1 e
+  reportaria ΔIC = 0 falso. `baseline_econ.caminho_checkpoint/
+  caminho_completo` separam os arquivos por versão; o baseline mantém o
+  nome original.
+- `baseline_econ.py --sem-relatorio` roda e grava CSV sem sobrescrever o
+  relatório multi-versão.
+
 ### Armadilha descoberta na Etapa 1 — degradação silenciosa
 - **O EconAgent degrada graciosamente por contrato** (neutro + aviso, sem
   exceção). O retry da calibração só capturava EXCEÇÃO → 119 de 610

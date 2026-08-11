@@ -137,3 +137,137 @@ Score no topo com retorno no fundo (ou o inverso) — a mesma moeda do Spearman.
 - Target usa Close AJUSTADO (`_retorno_excesso_5d`), enquanto o MATH&ML usa Close_raw; diferença esperada é pequena.
 
 CSV completo: `calibration/results/calibracao_baseline_completo.csv`
+
+<!-- etapa2:2026-08-econB -->
+
+## Iteração — prompt `2026-08-econB`
+
+### Mudança no prompt
+
+Eixo 1 — SURPRESA vs CONSENSO. O prompt v1 pedia o MECANISMO econômico da notícia, o que o LLM lia como "notícia boa → score positivo". A v2 instrui que a nota mede o DELTA entre o anunciado e o já esperado: surpresa para cima → positivo, confirmação de expectativa → ~0 mesmo com número excelente, surpresa para baixo → negativo; |score| > 0,5 reservado a surpresa genuína. Como só ~17% das notícias trazem consenso explícito no corpo, a inferência foi hierárquica: (1) consenso declarado no texto; (2) na ausência, natureza do evento (rotineiro/antecipável → zero; inesperado → magnitude), com proibição explícita de inferir a expectativa a partir de memória do desfecho. Tool schema de score_total/componente_noticia atualizado no mesmo sentido. Contrato da v1 preservado (Opção A, contexto não somado, múltiplas notícias, anti-lookahead).
+
+### Resultados
+
+- IC completo: +0.0758 [-0.0141, +0.1614]
+- IC limpo: +0.0015 [-0.1514, +0.1273] (n=281)
+- Lexical B0 limpo: +0.0382 (referência fixa)
+- GAP limpo: -0.0367
+- ΔIC limpo vs baseline: -0.0122
+- ΔIC limpo vs iteração anterior: n/d
+- Custo desta iteração: US$ 3.1841
+- Custo acumulado Etapa 2: US$ 3.1841
+- Taxa de degradação: 0.0% | latência mediana 4.14s
+- Dispersão do score: desvio 0.3296, zeros 14
+
+### Diagnóstico
+
+- **LREN3 tracker**: 4 de 10 piores casos — o eixo 1 NÃO resolveu o caso emblemático.
+
+**Piores casos desta versão:**
+
+| ticker | data | score | y |
+|---|---|---|---|
+| CMIN3.SA | 2024-11-06 | +0.65 | -0.1229 |
+| LREN3.SA | 2024-05-08 | +0.65 | -0.0901 |
+| MGLU3.SA | 2024-03-18 | +0.65 | -0.0901 |
+| MGLU3.SA | 2024-06-24 | +0.65 | -0.0778 |
+| LREN3.SA | 2024-11-07 | +0.65 | -0.0612 |
+| LREN3.SA | 2025-02-27 | -0.65 | +0.0563 |
+| PETR4.SA | 2024-09-26 | -0.65 | +0.0548 |
+| LREN3.SA | 2025-02-25 | -0.65 | +0.0533 |
+| ASAI3.SA | 2024-10-17 | -0.55 | +0.0684 |
+| GGBR4.SA | 2025-10-01 | -0.55 | +0.0512 |
+
+- Piores tickers: LREN3.SA (-0.274), VALE3.SA (-0.214), RDOR3.SA (-0.193), BBSE3.SA (-0.077)
+- Melhores tickers: EGIE3.SA (+0.385), CYRE3.SA (+0.387), BBAS3.SA (+0.446)
+
+<!-- etapa2:comparativo -->
+
+## Comparativo entre versões
+
+| Versão | n | IC completo | IC limpo | GAP limpo | Custo iter | Custo acum |
+|---|---|---|---|---|---|---|
+| 2026-06-econA | 636 | +0.0581 | +0.0137 | -0.0245 | US$ 2.7937 | US$ 2.7937 |
+| 2026-08-econB | 636 | +0.0758 | +0.0015 | -0.0367 | US$ 3.1841 | US$ 5.9778 |
+
+<!-- etapa2:conclusao -->
+## Conclusão da Etapa 2 — encerrada após 1 iteração
+
+**Versão final adotada: `2026-06-econA` (o baseline).** A v2 foi revertida no
+código; permanece documentada aqui, com o texto integral no anexo, para que o
+experimento seja reproduzível.
+
+### Por que parou
+
+A regra de parada disparou já na iteração 1: o IC limpo caiu de +0,0137 para
++0,0015 (ΔIC = −0,0122). Mas o motivo de encerrar a etapa inteira, e não apenas
+reverter e tentar o próximo eixo, é o que o corte por janela revelou:
+
+| Janela | n | IC v1 | IC v2 | Δ |
+|---|---|---|---|---|
+| Contaminada (< 2025-08-01) | 355 | +0,0764 | +0,1032 | +0,0268 |
+| **Limpa (≥ 2025-08-01)** | 281 | +0,0137 | +0,0015 | **−0,0122** |
+
+O prompt melhorou o IC **apenas onde o modelo pode ter visto o desfecho no
+treino**. Essa é a assinatura de memória que a Defesa 1 existe para detectar — e
+o critério de overfit que `calibrar()` já documentava como motivo de parada:
+"IC `dentro_treino` sobe mas IC `limpo` NÃO sobe (ou cai) entre iterações".
+
+A explicação é direta: só **17%** das notícias trazem consenso explícito no corpo
+Bloomberg. Nos outros 83%, perguntar "isso surpreendeu?" sem dar o consenso
+convida o modelo a responder de memória. Onde ele tem memória, acerta mais; onde
+não tem, a instrução extra só adiciona ruído.
+
+### A instrução foi obedecida — o problema não é o prompt
+
+| | v1 | v2 |
+|---|---|---|
+| Score médio | +0,1051 | +0,0385 |
+| Desvio | 0,3801 | 0,3296 |
+| `\|score\| > 0,5` | 27,0% | 17,6% |
+| `\|score\| ≤ 0,1` | 5,8% | **16,5%** |
+| Eventos com score alterado | — | 54,1% |
+
+O modelo de fato passou a puxar notícia rotineira para perto de zero, que era o
+objetivo. O comportamento mudou; o poder preditivo na janela limpa, não.
+
+### LREN3 tracker
+
+Continua **4 de 10** nos piores casos, e o IC isolado do ticker mal se moveu
+(−0,3034 → −0,2744). O eixo 1 não resolveu o caso que o motivou.
+
+### A limitação que encerra a etapa
+
+Nenhuma dessas diferenças é estatisticamente distinguível. O IC95 do IC limpo tem
+largura ≈ 0,28 ([−0,1514, +0,1273] na v2) enquanto os efeitos perseguidos são de
+0,01–0,03 — uma ordem de grandeza abaixo do erro amostral. Com n=281 e 23 blocos,
+o block bootstrap está corretamente indicando que **a amostra não tem poder para
+resolver essa pergunta**.
+
+Continuar iterando a US$3,18 por rodada perseguiria diferenças dentro do ruído.
+As alternativas reais não são de prompt:
+
+1. **Mais poder amostral** — desligar a deduplicação levaria a janela limpa de
+   281 para ~683 eventos, estreitando o IC95. Não corrige contaminação e custa
+   ~US$9 por rodada.
+2. **Consenso como dado, não como inferência** — o eixo 1 só é testável de
+   verdade com dados ERN (estimativa × realizado) no dossiê. O arquivo
+   `earnings_bloomberg.xlsx` não existe na máquina; sem ele, 83% dos eventos
+   ficam sem âncora.
+3. **Aceitar o resultado** — o ECON, como sinal isolado, tem IC indistinguível de
+   zero na janela limpa. Isso é um achado legítimo e reportável: o MATH&ML
+   combina o score com outras features, e o valor do ECON no sistema completo é
+   medido lá, não aqui.
+
+### Custos
+
+- Etapa 1 (baseline): US$ 2,7937
+- Etapa 2 (1 iteração): US$ 3,1841
+- **Total da calibração: US$ 5,9778** — de um cap de US$ 15 para a Etapa 2, do
+  qual sobraram US$ 11,82 não gastos.
+
+### Anexo — prompt `2026-08-econB` (revertido, preservado para reprodução)
+
+```text
+Você é um analista fundamentalista sênior de ações brasileiras (buy-side). O 'score_total' é sua nota PRINCIPAL: o impacto da(s) notícia(s) no retorno EM EXCESSO ao Ibovespa nos próximos 5 dias úteis (-1 muito negativo, 0 neutro, +1 muito positivo); ele deve refletir essencialmente o 'componente_noticia'. SURPRESA, NÃO DIREÇÃO: o preço já embute a expectativa. O mercado brasileiro incorpora o consenso semanas antes do anúncio, então sua nota mede o DELTA entre o que foi anunciado e o que já era esperado — NÃO se a notícia é 'boa' ou 'ruim' em termos absolutos. Três casos: (a) SURPREENDE PARA CIMA (melhor que o esperado) → score positivo; (b) CONFIRMA a expectativa → score próximo de ZERO, mesmo que o número em si seja excelente; (c) SURPREENDE PARA BAIXO (pior que o esperado) → score negativo. Um resultado trimestral forte e amplamente antecipado merece ~0, não +0,6. Reserve |score| > 0,5 para surpresa GENUÍNA: magnitude muito fora do consenso, evento inesperado ou mudança de regime. COMO INFERIR O QUE ERA ESPERADO — nesta ordem: (1) use o consenso declarado NO PRÓPRIO TEXTO ('estimate', 'consensus', 'estimativa', 'acima/abaixo do esperado', projeções de analistas citadas); (2) se o texto não trouxer consenso, julgue pela NATUREZA do evento: rotineiro e antecipável (resultado dentro do calendário, dividendo recorrente, guidance reiterado, follow-up de fato já divulgado) puxa para zero; genuinamente inesperado (M&A, troca de comando, decisão regulatória, fraude, acidente, revisão abrupta de guidance) justifica magnitude. JAMAIS infira a expectativa a partir do que você lembra que aconteceu depois — isso é lookahead e invalida a avaliação. Na dúvida sobre o consenso, fique perto de zero e REDUZA a 'confianca'. Avalie o MECANISMO econômico (efeito em caixa, margem, posição competitiva ou múltiplo), não o tom do texto. Saúde financeira (fundamentos TTM), momento setorial e cenário macro são o CONTEXTO que calibra a leitura (a mesma surpresa pesa mais numa empresa frágil) — você os reporta nos campos próprios, mas eles NÃO são parcelas somadas ao score_total. Desconte ruído sem efeito fundamental (ex.: política genérica). MÚLTIPLAS NOTÍCIAS: pondere pelo impacto fundamental e pela confiabilidade da fonte; notícias contraditórias entre si devem REDUZIR a 'confianca'. ANTI-LOOKAHEAD: raciocine APENAS com os dados fornecidos, como se a data de hoje fosse a data_limite informada; jamais use conhecimento de fatos posteriores a essa data. Responda EXCLUSIVAMENTE chamando a ferramenta registrar_avaliacao.
+```

@@ -311,6 +311,36 @@ class TestFoiAvaliado:
                               "tokens_in": 0}) is False
 
 
+class TestCaminhosPorVersao:
+    """O checkpoint é chaveado por (modelo, evento_id) — SEM versão de prompt. Se
+    duas iterações compartilharem arquivo, a segunda retoma os scores da primeira
+    e reporta ΔIC = 0 falso. A separação tem que vir do caminho."""
+
+    def test_versoes_diferentes_usam_arquivos_diferentes(self):
+        from calibration.baseline_econ import caminho_checkpoint
+
+        assert caminho_checkpoint("2026-06-econA") != caminho_checkpoint("2026-08-econB")
+
+    def test_baseline_preserva_o_arquivo_ja_pago(self):
+        """A Etapa 1 custou US$2,79; seu checkpoint não pode mudar de nome."""
+        from calibration.baseline_econ import (
+            INTERMEDIARIO_CSV, VERSAO_BASELINE, caminho_checkpoint,
+        )
+
+        assert caminho_checkpoint(VERSAO_BASELINE) == INTERMEDIARIO_CSV
+
+    def test_nome_de_arquivo_e_seguro(self):
+        from calibration.baseline_econ import caminho_checkpoint
+
+        nome = caminho_checkpoint("2026-08/econ B").name
+        assert "/" not in nome and " " not in nome
+
+    def test_csv_completo_tambem_e_por_versao(self):
+        from calibration.baseline_econ import caminho_completo
+
+        assert caminho_completo("2026-06-econA") != caminho_completo("2026-08-econB")
+
+
 class TestVeredito:
     def test_acima_da_meta(self):
         assert "SUFICIENTE" in _veredito(0.20)

@@ -1,0 +1,1 @@
+{"versao": "2026-08-econB", "ic_dentro_treino": 0.07581659636898115, "ic_limpo": 0.0015006869358477498, "decisao": "piorou_vs_baseline", "resumo_diff": "Eixo 1 — SURPRESA vs CONSENSO. O prompt v1 pedia o MECANISMO econômico da notícia, o que o LLM lia como \"notícia boa → score positivo\". A v2 instrui que a nota mede o DELTA entre o anunciado e o já es"}

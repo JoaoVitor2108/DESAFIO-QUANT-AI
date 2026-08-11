@@ -27,6 +27,7 @@ estimativa de custo) e depois sem a flag (requer ANTHROPIC_API_KEY).
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -93,6 +94,34 @@ RELATORIO_MD = RESULTS_DIR / "RELATORIO_CALIBRACAO_ECON.md"
 COMPLETO_CSV = RESULTS_DIR / "calibracao_baseline_completo.csv"
 INTERMEDIARIO_CSV = RESULTS_DIR / "calibracao_baseline_intermediario.csv"
 AMOSTRAGEM_JSON = RESULTS_DIR / "calibracao_baseline_amostragem.json"
+
+# Versão de prompt cuja rodada produziu os artefatos da Etapa 1 (já pagos).
+VERSAO_BASELINE = "2026-06-econA"
+
+
+def _slug(versao: str) -> str:
+    """Versão de prompt como pedaço seguro de nome de arquivo."""
+    return re.sub(r"[^0-9A-Za-z._-]+", "-", versao).strip("-")
+
+
+def caminho_checkpoint(versao: str) -> Path:
+    """Checkpoint POR VERSÃO DE PROMPT.
+
+    A chave interna do checkpoint é (modelo, evento_id) — não inclui o prompt.
+    Se duas iterações dividissem o arquivo, a segunda retomaria os scores da
+    primeira e reportaria ΔIC = 0 sem nenhum sinal de erro. A separação vem daqui.
+    O baseline mantém o nome original: aquele arquivo custou US$2,79.
+    """
+    if versao == VERSAO_BASELINE:
+        return INTERMEDIARIO_CSV
+    return RESULTS_DIR / f"calibracao_{_slug(versao)}_intermediario.csv"
+
+
+def caminho_completo(versao: str) -> Path:
+    """CSV de resultado por versão de prompt (mesma razão do checkpoint)."""
+    if versao == VERSAO_BASELINE:
+        return COMPLETO_CSV
+    return RESULTS_DIR / f"calibracao_{_slug(versao)}_completo.csv"
 
 
 # ── Etapa A — amostragem de eventos ───────────────────────────────────────────
@@ -173,8 +202,9 @@ def amostrar_eventos(journal, janela_inicio: pd.Timestamp, janela_fim: pd.Timest
 # ── Fechamento offline a partir do checkpoint ─────────────────────────────────
 
 
-def carregar_de_checkpoint(journal, caminho: Path = INTERMEDIARIO_CSV,
-                           modelo: str = MODELO) -> tuple[pd.DataFrame, dict]:
+def carregar_de_checkpoint(journal, caminho: Path | None = None,
+                           modelo: str = MODELO,
+                           versao: str = VERSAO_BASELINE) -> tuple[pd.DataFrame, dict]:
     """Reconstrói o dataset da rodada a partir do checkpoint, SEM tocar a rede.
 
     Existe porque re-derivar a amostra depende de yfinance (target) e BCB (macro),
@@ -186,6 +216,7 @@ def carregar_de_checkpoint(journal, caminho: Path = INTERMEDIARIO_CSV,
     """
     from agents.econ import _MAX_NOTICIAS
 
+    caminho = caminho if caminho is not None else caminho_checkpoint(versao)
     prev = pd.read_csv(caminho)
     prev = prev[prev["modelo"] == modelo]
     # O checkpoint é append-only: uma reavaliação grava uma linha NOVA para o
@@ -779,7 +810,8 @@ def gerar_relatorio(df: pd.DataFrame, diag: dict, met: dict, dgn: dict,
                  "foi RE-BUSCADA com o mesmo prompt e modelo.")
     L.append("- Target usa Close AJUSTADO (`_retorno_excesso_5d`), enquanto o "
              "MATH&ML usa Close_raw; diferença esperada é pequena.")
-    L.append(f"\nCSV completo: `{COMPLETO_CSV.relative_to(COMPLETO_CSV.parents[2])}`")
+    csv = caminho_completo(versao_prompt)
+    L.append(f"\nCSV completo: `{csv.relative_to(csv.parents[2])}`")
     return "\n".join(L) + "\n"
 
 
@@ -844,6 +876,9 @@ def _parse_args(argv=None):
     p.add_argument("--data-fim", default=None, help="YYYY-MM-DD (default 2025-12-31)")
     p.add_argument("--cascata-completa", action="store_true",
                    help="usa GDELT+NewsAPI além do Bloomberg (default: Bloomberg-only)")
+    p.add_argument("--sem-relatorio", action="store_true",
+                   help="roda e grava os CSVs, mas NÃO escreve o relatório — usado "
+                        "pela Etapa 2, que monta um relatório multi-versão")
     p.add_argument("--finalizar", action="store_true",
                    help="gera o relatório a partir do checkpoint, sem rede nem API")
     p.add_argument("--reavaliar-degradadas", action="store_true",
@@ -859,7 +894,7 @@ def _finalizar(journal, versao_prompt: str, recuperar: bool = False,
                reavaliar: bool = False) -> int:
     """Fecha a rodada offline: métricas e relatório a partir do checkpoint."""
     print("\n[F] Reconstruindo dataset do checkpoint (sem rede, sem API)...", flush=True)
-    df, diag = carregar_de_checkpoint(journal)
+    df, diag = carregar_de_checkpoint(journal, versao=versao_prompt)
     if df.empty:
         print("[F] ⛔ checkpoint vazio ou sem linhas do modelo — nada a finalizar.")
         return 6
@@ -874,10 +909,10 @@ def _finalizar(journal, versao_prompt: str, recuperar: bool = False,
         instalar_captura()
         n_alvo = int((~df["chamou_api"].astype(bool)).sum())
         print(f"[F] Reavaliando {n_alvo} eventos degradados...", flush=True)
-        cp = Checkpoint(INTERMEDIARIO_CSV)
+        cp = Checkpoint(caminho_checkpoint(versao_prompt))
         n_ok = reavaliar_degradadas(journal, cp, df, gasto)
         print(f"[F] {n_ok}/{n_alvo} recuperados | custo US$ {gasto[0]:.4f}", flush=True)
-        df, diag = carregar_de_checkpoint(journal)
+        df, diag = carregar_de_checkpoint(journal, versao=versao_prompt)
         custo_total = float(df["custo_usd"].sum())
 
     dgn = diagnosticar(df)
@@ -887,12 +922,12 @@ def _finalizar(journal, versao_prompt: str, recuperar: bool = False,
         print(f"[F] Re-buscando justificativa dos {len(dgn['piores_casos'])} "
               "piores casos...", flush=True)
         df = recuperar_justificativas(journal, df, dgn["piores_casos"], gasto,
-                                      Checkpoint(INTERMEDIARIO_CSV))
+                                      Checkpoint(caminho_checkpoint(versao_prompt)))
         custo_total += gasto[0]
         dgn = diagnosticar(df)  # recomputa com as justificativas preenchidas
         print(f"[F] re-busca custou US$ {gasto[0]:.4f}", flush=True)
 
-    df.to_csv(COMPLETO_CSV, index=False)
+    df.to_csv(caminho_completo(versao_prompt), index=False)
     met = calcular_metricas(df)
     md = gerar_relatorio(df, diag, met, dgn, versao_prompt, custo_total, parcial)
     RELATORIO_MD.write_text(md, encoding="utf-8")
@@ -967,7 +1002,7 @@ def main(argv=None) -> int:
         print(f"[MACRO] ⛔ {e}")
         return 5
 
-    checkpoint = Checkpoint(INTERMEDIARIO_CSV)
+    checkpoint = Checkpoint(caminho_checkpoint(_PROMPT_VERSION))
     alinhamento = conferir_alinhamento(eventos, checkpoint)
     if alinhamento["n_desalinhados"]:
         print(f"[ALINHAMENTO] ⛔ {alinhamento['n_desalinhados']} de "
@@ -993,7 +1028,13 @@ def main(argv=None) -> int:
     df = pd.DataFrame(linhas)
     if len(df) < len(eventos):
         parcial = True
-    df.to_csv(COMPLETO_CSV, index=False)
+    df.to_csv(caminho_completo(_PROMPT_VERSION), index=False)
+
+    if args.sem_relatorio:
+        print(f"\n[C] --sem-relatorio: CSV gravado em "
+              f"{caminho_completo(_PROMPT_VERSION).name}; relatório é da Etapa 2.")
+        print(f"Custo real total: US$ {custo[0]:.4f}")
+        return 0
 
     print("\n[C] Métricas + diagnóstico...", flush=True)
     met = calcular_metricas(df)
