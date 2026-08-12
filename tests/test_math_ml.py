@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 from scipy.stats import spearmanr
 
-from config import FUSO
+from config import FUSO, UNIVERSO_HISTORICO, ticker_para_yfinance
 from agents.journal import Fundamentals
 from agents.econ import ScoreEcon
 from agents.math_ml import (
@@ -25,6 +25,10 @@ from agents.math_ml import (
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def econ_mod_universo():
+    return UNIVERSO_HISTORICO
 
 
 def ts(s: str) -> pd.Timestamp:
@@ -971,3 +975,115 @@ def test_regra_de_platau_usa_platau_quando_razoavel():
     assert info["n_argmax"] == 50
     assert 20 <= n_esc <= 50       # usou o platô, não o argmax puro nem n=1
     assert "platau" in info["fonte"] and "fallback" not in info["fonte"]
+
+
+# ── Alias de ticker para o yfinance + corte por data de saída ─────────────────
+#
+# O universo indexa empresas pelo nome histórico; o yfinance migra a série
+# inteira para o símbolo novo quando há rebrand/reestruturação e devolve ZERO
+# linha para o antigo, inclusive em datas muito anteriores à mudança.
+
+
+def test_ticker_para_yfinance_resolve_elet3_para_axia3():
+    assert ticker_para_yfinance("ELET3.SA") == "AXIA3.SA"
+
+
+def test_ticker_para_yfinance_resolve_jbss3_para_jbss32():
+    # JBSS3 não é caso de "delistado após a saída": o yfinance não devolve nada
+    # nem para 2019-2023. A série viva é a do BDR pós-migração.
+    assert ticker_para_yfinance("JBSS3.SA") == "JBSS32.SA"
+
+
+def test_ticker_para_yfinance_mantem_ticker_sem_alias():
+    for t in ("PETR4.SA", "VALE3.SA", "ITUB4.SA", "^BVSP"):
+        assert ticker_para_yfinance(t) == t
+
+
+def test_get_precos_pede_simbolo_aliasado_ao_yfinance(monkeypatch, tmp_path):
+    """O alias entra na CHAMADA; o consumidor segue falando ELET3."""
+    from agents import journal as jmod
+
+    pedidos = []
+    idx = _dias_uteis("2024-01-02", 30)
+
+    def _fake_download(simbolo, **kw):
+        pedidos.append(simbolo)
+        return pd.DataFrame(
+            {"Open": 10.0, "High": 11.0, "Low": 9.0, "Close": 10.5, "Volume": 1000},
+            index=idx.tz_localize(None),
+        )
+
+    monkeypatch.setattr(jmod.yf, "download", _fake_download)
+    j = jmod.JournalAgent(cache_dir=tmp_path)
+
+    df = j.get_precos("ELET3.SA", ts("2024-01-02"), ts("2024-02-09"))
+
+    assert pedidos and all(s == "AXIA3.SA" for s in pedidos)
+    assert "ELET3" not in pedidos
+    assert len(df) > 0
+
+
+def test_prefetch_limita_range_por_data_saida(monkeypatch, tmp_path):
+    """Ticker com `saida` não pode ter preço pedido além dela.
+
+    Depois da saída o símbolo negocia OUTRO instrumento (BDR pós-migração):
+    deixar o label atravessar o evento societário registraria um retorno que
+    nenhuma posição realizaria.
+    """
+    jr, idx, tks = _journal_random(["AAA3.SA"], n_dias=320)
+    saida = idx[200]
+    monkeypatch.setitem(econ_mod_universo(), "AAA3.SA",
+                        {"setor": "x", "entrada": None, "saida": saida})
+
+    pedidos = {}
+    original = jr.get_precos
+
+    def _spy(ticker, ini, fim, **kw):
+        pedidos[ticker] = fim
+        return original(ticker, ini, fim, **kw)
+
+    jr.get_precos = _spy
+    agent = MathMLAgent(journal=jr, econ_mock=make_econ_mock(jr, ic_alvo=0.0), config=_cfg())
+    agent._prefetch(["AAA3.SA"], idx[100], idx[-1])
+
+    assert pedidos["AAA3.SA"] <= saida
+
+
+def test_prefetch_ticker_sem_saida_usa_range_completo(monkeypatch, tmp_path):
+    jr, idx, tks = _journal_random(["AAA3.SA"], n_dias=320)
+    monkeypatch.setitem(econ_mod_universo(), "AAA3.SA",
+                        {"setor": "x", "entrada": None, "saida": None})
+
+    pedidos = {}
+    original = jr.get_precos
+
+    def _spy(ticker, ini, fim, **kw):
+        pedidos[ticker] = fim
+        return original(ticker, ini, fim, **kw)
+
+    jr.get_precos = _spy
+    agent = MathMLAgent(journal=jr, econ_mock=make_econ_mock(jr, ic_alvo=0.0), config=_cfg())
+    agent._prefetch(["AAA3.SA"], idx[100], idx[-1])
+
+    # Sem saída, o fim pedido é o range estendido (>= fim solicitado).
+    assert pedidos["AAA3.SA"] >= idx[-1]
+
+
+def test_prefetch_ticker_desconhecido_no_universo_nao_quebra(monkeypatch):
+    """`UNIVERSO_HISTORICO.get(...)` sem entrada → range completo, sem KeyError."""
+    jr, idx, tks = _journal_random(["ZZZ9.SA"], n_dias=320)
+    agent = MathMLAgent(journal=jr, econ_mock=make_econ_mock(jr, ic_alvo=0.0), config=_cfg())
+
+    cache = agent._prefetch(["ZZZ9.SA"], idx[100], idx[-1])
+
+    assert "ZZZ9.SA" in cache.precos
+
+
+def test_prefetch_todos_os_tickers_do_universo_tem_preco(monkeypatch):
+    """Sanity: nenhum ticker do universo fica de fora do painel por falta de preço."""
+    jr, idx, tks = _journal_random(["AAA3.SA", "BBB3.SA", "CCC3.SA"], n_dias=320)
+    agent = MathMLAgent(journal=jr, econ_mock=make_econ_mock(jr, ic_alvo=0.0), config=_cfg())
+
+    cache = agent._prefetch(tks, idx[100], idx[-1])
+
+    assert set(cache.precos) == set(tks)

@@ -35,6 +35,7 @@ from config import (
     UNIVERSO_HISTORICO,
     WHITELIST_FONTES,
     tickers_ativos,
+    ticker_para_yfinance,
 )
 from agents.sources.bloomberg_csv import BloombergCSVSource
 from agents.sources.cvm import CVMSource
@@ -440,21 +441,26 @@ class JournalAgent:
         end = (data_limite + pd.Timedelta(days=1)).date()
         start = data_inicio.date()
 
+        # Símbolo que o yfinance reconhece hoje (ELET3→AXIA3, JBSS3→JBSS32).
+        # Só a LEITURA usa o alias: o DataFrame devolvido continua indexado pelo
+        # ticker do universo, e nenhum consumidor precisa saber da troca.
+        simbolo = ticker_para_yfinance(ticker)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
                 df_adj = yf.download(
-                    ticker, start=start, end=end,
+                    simbolo, start=start, end=end,
                     auto_adjust=True, progress=False, multi_level_index=False,
                 )
                 df_raw = yf.download(
-                    ticker, start=start, end=end,
+                    simbolo, start=start, end=end,
                     auto_adjust=False, progress=False, multi_level_index=False,
                 )
             except TypeError:
                 # Versão antiga do yfinance sem multi_level_index
-                df_adj = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-                df_raw = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
+                df_adj = yf.download(simbolo, start=start, end=end, auto_adjust=True, progress=False)
+                df_raw = yf.download(simbolo, start=start, end=end, auto_adjust=False, progress=False)
 
         # Achatar MultiIndex se vier (compatibilidade entre versões do yfinance)
         for df in (df_adj, df_raw):

@@ -299,6 +299,31 @@ UNIVERSO_HISTORICO: dict[str, dict] = {
 }
 
 
+# Ticker do JEMPO → símbolo que o yfinance reconhece HOJE.
+#
+# O universo indexa empresas pelo nome histórico (consistência com 2019-2023 e
+# com o `TICKER_ALIAS` do parser Bloomberg, que aponta na direção oposta:
+# Bloomberg → JEMPO). Quando uma empresa é renomeada ou reestruturada, o
+# yfinance migra a SÉRIE INTEIRA para o símbolo novo e passa a devolver zero
+# linha para o antigo — inclusive para datas muito anteriores à mudança.
+# Verificado: `AXIA3.SA` e `JBSS32.SA` trazem o histórico completo desde 2019,
+# com preços que batem com os de `ELET3.SA`/`JBSS3.SA` na época.
+#
+# Este mapa é só de LEITURA de preço. Não renomeia nada no universo.
+TICKER_YFINANCE: dict[str, str] = {
+    "ELET3.SA": "AXIA3.SA",    # Eletrobras → Axia Energia (privatização)
+    "JBSS3.SA": "JBSS32.SA",   # JBS → BDR pós-migração para a NYSE (jun/2025)
+}
+
+
+def ticker_para_yfinance(ticker: str) -> str:
+    """Resolve alias de ticker para chamadas ao yfinance.
+
+    Tickers sem alias passam intactos. Ver `TICKER_YFINANCE` para o porquê.
+    """
+    return TICKER_YFINANCE.get(ticker, ticker)
+
+
 def tickers_ativos(data: pd.Timestamp) -> list[str]:
     """Retorna tickers cuja janela [entrada, saida] contém `data`.
 

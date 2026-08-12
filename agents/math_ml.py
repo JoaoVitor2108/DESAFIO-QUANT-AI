@@ -56,6 +56,7 @@ from config import (
     FIM_TREINO,
     INICIO_BACKTEST,
     FIM_BACKTEST,
+    UNIVERSO_HISTORICO,
     tickers_ativos,
 )
 
@@ -455,8 +456,16 @@ class MathMLAgent:
             # Tolera ticker sem dados (delisted / 404 no yfinance): pula em vez de
             # abortar o run — espelha o try/except do caminho por-linha em
             # construir_dataset. Ticker ausente do cache é filtrado na Fase 2.
+            # Não pede preço além da data de saída do universo. Depois de uma
+            # reestruturação o símbolo do yfinance continua negociando OUTRO
+            # instrumento (JBSS32 é o BDR pós-migração para a NYSE, com salto de
+            # ~80% em jun/2025). Sem este corte, o LABEL das últimas linhas do
+            # ticker olharia para frente através do evento societário e
+            # registraria um retorno que nenhuma posição realizaria.
+            saida = UNIVERSO_HISTORICO.get(ticker, {}).get("saida")
+            fim_ticker = min(fetch_fim, saida) if saida is not None else fetch_fim
             try:
-                precos = self.journal.get_precos(ticker, fetch_inicio, fetch_fim)
+                precos = self.journal.get_precos(ticker, fetch_inicio, fim_ticker)
             except Exception as e:
                 logger.warning("_prefetch: get_precos(%s) falhou (%s) — ticker "
                                "excluído do run", ticker, e)
