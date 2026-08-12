@@ -375,10 +375,12 @@ def _render_relatorio(resultados, treino_ini, treino_fim, oos_ini, oos_fim,
     L.append("4. Universo restrito ao `UNIVERSO_HISTORICO` — pode não cobrir "
              "100% do IBOV em cada data.")
     n_lim = 5
-    L.append(f"{n_lim}. **Tickers sem dados:** ELET3.SA e JBSS3.SA não são "
-             "baixáveis pelo yfinance neste ambiente (404) e foram EXCLUÍDOS do "
-             "painel (`_prefetch` os pula). Cobertura reduzida no(s) setor(es) "
-             "afetado(s).")
+    L.append(f"{n_lim}. **Alias de ticker no yfinance:** ELET3.SA e JBSS3.SA não "
+             "existem mais no yfinance — rebrand/reestruturação zera o símbolo "
+             "antigo retroativamente. `config.TICKER_YFINANCE` resolve para "
+             "AXIA3.SA e JBSS32.SA na leitura de preço, e ambos ESTÃO no painel. "
+             "`_prefetch` corta o range em `data_saida` para o label não "
+             "atravessar evento societário (JBSS32 salta ~80% na migração NYSE).")
     n_lim += 1
     if not hasattr(jbss3_saida, "date"):
         L.append(f"{n_lim}. **Survivorship JBSS3:** `saida=None` no config — se o "
